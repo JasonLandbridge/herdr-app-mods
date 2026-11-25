@@ -1,0 +1,13 @@
+# Herdr writes these files into live mod folders; they are not source.
+gpui-kit.d.ts
+herdr.d.ts
+jsconfig.json
+*.error
+.DS_Store
+__pycache__/
+*.pyc
+*.before-over9k
+*.before-update
+
+# Per-install sidebar state, created on first launch.
+/sidebar-overhaul/sidebar.config.json

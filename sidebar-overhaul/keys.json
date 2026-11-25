@@ -1,0 +1,11 @@
+{
+  "global": {
+    "ctrl-tab": "sidebar-overhaul.switcher",
+    "ctrl-shift-w": "sidebar-overhaul.close-tab",
+    "ctrl-shift-x": "sidebar-overhaul.close-pane"
+  },
+  "mod:sidebar-overhaul": {
+    "ctrl-tab": "sidebar-overhaul.next",
+    "ctrl-shift-tab": "sidebar-overhaul.prev"
+  }
+}

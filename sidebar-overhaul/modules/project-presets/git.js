@@ -1,0 +1,414 @@
+// Everything that touches git or starts a space. `log(msg)` reports progress to the picker.
+import { exec as rawExec, hc, run, focused, spaces, home, writeTextFile } from "herdr";
+import { log } from "./log.js";
+import { resolveWorktreeDestination } from "./config.js";
+import { splitArgs, slug, branchName, expandHome, expand, basename, dateStamp, timeStamp, parseWorktrees, layoutPlan, inFolder, scanCommand, parseScan } from "./lib.js";
+
+/** exec, logged in debug mode: command, folder, exit code and the first line of stderr. */
+async function exec(command, args = [], options = {}) {
+  try {
+    const r = await rawExec(command, args, options);
+    log("debug", `exec ${command} ${args.join(" ")}`, { cwd: options.cwd, code: r.code, err: r.stderr.split("\n")[0] });
+    return r;
+  } catch (e) {
+    log("error", `exec ${command} ${args.join(" ")} could not run: ${e.message}`, { cwd: options.cwd });
+    throw e;
+  }
+}
+const git = (cwd, args) => exec("git", args, { cwd });
+const out = (r) => r.stdout.trim();
+
+// herdr's home() crosses into the app on every call, and the picker asks for a folder per project per render.
+let homeDir;
+const homeOf = () => (homeDir ??= home());
+
+export const projectFolder = (p) => expandHome(p.path, homeOf());
+
+/** Checks the folder is a git checkout. Returns { top, branch }. Throws with the reason. */
+export async function inspect(folder) {
+  let r;
+  try {
+    r = await git(folder, ["rev-parse", "--show-toplevel", "--abbrev-ref", "HEAD"]);
+  } catch {
+    throw new Error(`Can't open ${folder}`);
+  }
+  if (r.code !== 0) throw new Error(`${folder} is not a git checkout`);
+  const [top, branch] = out(r).split("\n");
+  return { top, branch };
+}
+
+/** {user} is git config user.name, falling back to user.email's local part. */
+export async function gitUser(folder) {
+  for (const [key, pick] of [["user.name", (s) => s], ["user.email", (s) => s.split("@")[0]]]) {
+    const r = await git(folder, ["config", key]);
+    if (r.code === 0 && out(r)) return slug(pick(out(r)));
+  }
+  return "user";
+}
+
+export async function templateVars(project, slugText) {
+  const folder = projectFolder(project);
+  const { top } = await inspect(folder);
+  return {
+    user: await gitUser(folder),
+    date: dateStamp(),
+    slug: slug(slugText) || timeStamp(),
+    repo: basename(top),
+    project: slug(project.name),
+    name: project.name,
+  };
+}
+
+/** What the branch will be called, before collisions are resolved. */
+export async function previewBranch(project, slugText) {
+  const folder = projectFolder(project);
+  // The checkout's top folder and the git user don't change while someone types a name: ask git once per folder, not per keystroke.
+  let kept = previewKept.get(folder);
+  if (!kept || Date.now() - kept.at > 30000) {
+    const { top } = await inspect(folder);
+    kept = { at: Date.now(), top, user: await gitUser(folder) };
+    if (previewKept.size >= 50) previewKept.clear(); // a few folders in practice; this only stops endless growth
+    previewKept.set(folder, kept);
+  }
+  return branchName(project.worktree.branchTemplate, {
+    user: kept.user, date: dateStamp(), slug: slug(slugText) || timeStamp(),
+    repo: basename(kept.top), project: slug(project.name), name: project.name,
+  });
+}
+const previewKept = new Map(); // folder → { at, top, user }
+
+/** git fetch, tolerating failure (offline): the local ref is used instead. */
+async function fetchRemote(folder, g, log) {
+  if (!g.fetch) return;
+  log(`git fetch ${g.remote}…`);
+  try {
+    const r = await git(folder, ["fetch", g.remote]);
+    if (r.code !== 0) log(`fetch failed, using local refs: ${out({ stdout: r.stderr }).split("\n")[0]}`);
+  } catch {
+    log("fetch timed out, using local refs");
+  }
+}
+
+export async function baseRef(folder, g) {
+  for (const ref of [`${g.remote}/${g.base}`, g.base]) {
+    if ((await git(folder, ["rev-parse", "--verify", "--quiet", `${ref}^{commit}`])).code === 0) return ref;
+  }
+  throw new Error(`No base branch ${g.remote}/${g.base} or ${g.base} in this checkout`);
+}
+
+const exists = async (path) => (await exec("test", ["-e", path])).code === 0;
+
+/** Whether a folder exists on this machine (the picker uses it to flag imported projects whose folder is missing). */
+export const folderExists = async (path) => { try { return (await exec("test", ["-d", path])).code === 0; } catch { return false; } };
+
+/** Creates the worktree. The source-owned sidebar config chooses a flat destination; collisions fail. */
+export async function createWorktree(project, slugText, log, machine = null) {
+  const folder = projectFolder(project);
+  const { worktree: w, git: g } = project;
+  const inspected = await inspect(folder);
+  const sourceRoot = inspected.top;
+  if (project.machine) throw new Error("Remote project presets cannot create a worktree from this machine");
+  await fetchRemote(sourceRoot, g, log);
+  const base = await baseRef(sourceRoot, g);
+  const vars = await templateVars({ ...project, path: sourceRoot }, slugText);
+  const wanted = branchName(w.branchTemplate, vars);
+  if (!wanted) throw new Error("The branch name template produced an empty name");
+  if ((await git(sourceRoot, ["check-ref-format", "--branch", wanted])).code !== 0) throw new Error(`"${wanted}" is not a valid branch name`);
+  const targetMachine = machine ?? null;
+  const { machine: resolvedMachine, root, destination } = await resolveWorktreeDestination(sourceRoot, wanted, targetMachine);
+  if ((await exec("sh", ["-c", 'test -d "$1" && test -w "$1" && test -x "$1"', "sh", root])).code !== 0) {
+    throw new Error(`New worktree folder must exist and be writable: ${root}`);
+  }
+  if (await exists(destination)) throw new Error(`Worktree destination already exists on ${resolvedMachine}: ${destination}`);
+  if ((await git(sourceRoot, ["rev-parse", "--verify", "--quiet", `refs/heads/${wanted}`])).code === 0) throw new Error(`Branch ${wanted} already exists`);
+  log(`git worktree add ${wanted} from ${base}…`);
+  const r = await git(sourceRoot, ["worktree", "add", "--no-track", "-b", wanted, destination, base]);
+  if (r.code === 0) return { folder: destination, branch: wanted, vars, machine: resolvedMachine };
+  throw new Error(out({ stdout: r.stderr }) || "git worktree add failed");
+}
+
+/** The main checkout, brought up to date when fast-forward is on and that's safe. */
+export async function prepareMain(project, log) {
+  const folder = projectFolder(project);
+  const { branch } = await inspect(folder);
+  const g = project.git;
+  await fetchRemote(folder, g, log);
+  if (!g.fastForward) return;
+  if (branch !== g.base) return log(`not fast-forwarding: on ${branch}, not ${g.base}`);
+  if (out(await git(folder, ["status", "--porcelain"]))) return log("not fast-forwarding: uncommitted changes");
+  const r = await git(folder, ["merge", "--ff-only", `${g.remote}/${g.base}`]);
+  log(r.code === 0 ? `fast-forwarded ${g.base}` : "not fast-forwarding: local commits");
+}
+
+/** Setup commands, one after another, stopping at the first failure. exec has a 30 s limit each. */
+export async function runSetup(project, folder, log) {
+  for (const cmd of project.startup.setup) {
+    log(`$ ${cmd}`);
+    try {
+      const r = await exec("sh", ["-c", cmd], { cwd: folder });
+      if (r.code !== 0) return log(`setup failed (${r.code}): ${cmd}`);
+    } catch {
+      return log(`setup stopped (timed out or couldn't start): ${cmd}`);
+    }
+  }
+}
+
+/** The folder with symlinks resolved, or itself when it can't be (gone, unreadable). */
+async function realPath(p) {
+  try {
+    const r = await exec("sh", ["-c", 'cd "$1" 2>/dev/null && pwd -P', "sh", p]);
+    return r.code === 0 && out(r) ? out(r) : p;
+  } catch { return p; }
+}
+
+export const findSpace = (project) => spaces().find((s) => !s.machine && s.folder === projectFolder(project));
+
+/** Opens the folder as a space, with the project's agent, first prompt and extra tabs. */
+/** The sidebar name for a worktree's space, from the project's template; falls back to "<name> · <branch>". */
+export function worktreeSpaceName(project, wt) {
+  const name = expand(project.worktree.spaceName, { ...wt.vars, branch: wt.branch }).trim();
+  return name || `${project.name} · ${wt.branch}`;
+}
+
+// Launches take turns creating their space: the new terminal is found as "new since a snapshot",
+// which two overlapping launches into one folder would otherwise mix up.
+let spaceLock = Promise.resolve();
+// A turn that hangs (hc not answering) gives up its place after this long so later launches still run.
+export const lockSettings = { seconds: 25 };
+const exclusive = (fn) => {
+  const result = spaceLock.then(fn);
+  const done = result.then(() => {}, () => {});
+  spaceLock = Promise.race([done, sleep(lockSettings.seconds).then(() => {}, () => {})]);
+  return result;
+};
+
+/** The space space.new just made: not in `before`, with this name (and folder, when several), and its first pane. */
+async function findNewSpace(before, name, folder) {
+  for (let i = 0; i < 20; i++) {
+    try {
+      const r = await exec("herdr-app", ["ls"]);
+      const fresh = (JSON.parse(r.stdout || "{}").spaces ?? []).filter((s) => !before.has(s.id) && s.name === name);
+      const found = fresh.filter((s) => s.folder === folder).pop() ?? fresh.pop();
+      const pane = found?.tabs?.[0]?.terminals?.[0]?.pane;
+      if (found && pane) return { space: found.id, pane };
+    } catch {}
+    await sleep(0.25);
+  }
+  return null;
+}
+
+/** Splits the new space's first pane into the layout's panes. A failed split is logged and ends the layout;
+ *  the space and its agent are already open. Focus goes back to the agent. */
+async function buildLayout(layout, folder, root) {
+  const plan = layoutPlan(layout);
+  const ids = { [layout.panes[0]?.name ?? "agent"]: root };
+  for (const pane of plan) {
+    const argv = pane.type === "command" ? ["sh", "-c", pane.command] : [];
+    const r = await exec("herdr-app", ["do", "pane.split", JSON.stringify({ direction: pane.direction, pane: ids[pane.from], argv: inFolder(folder, argv) })]);
+    let made = {};
+    try { made = JSON.parse(r.stdout || "{}"); } catch {}
+    if (r.code !== 0 || made.error || !made.pane) {
+      log("error", `layout "${layout.name}": couldn't split for ${pane.name}`, { code: r.code, error: made.error ?? r.stderr.split("\n")[0] });
+      break;
+    }
+    ids[pane.name] = made.pane;
+  }
+  run("pane.focus", { pane: root });
+}
+
+export async function launch(project, folder, name, layout = null) {
+  const { agent, args, prompt, promptMode, tabs } = project.startup;
+  const argv = agent.trim() ? [...splitArgs(agent), ...splitArgs(args)] : [];
+  // "arg": herdr appends the prompt to the command line (claude and most agents take that).
+  // "send": start the agent bare and type the prompt once it is ready (hermes and others
+  // that read a positional argument as a subcommand).
+  const send = argv.length && prompt && promptMode === "send";
+  const terminal = await exclusive(async () => {
+    const spacesBefore = new Set(spaces().map((s) => s.id));
+    const known = send ? new Set((await liveTerminals()).map((t) => t.address)) : null;
+    // Herdr nests a worktree's space under its repo's own space, but only while that one is open.
+    const main = projectFolder(project);
+    if (project.worktree.repoSpace && folder !== main && !findSpace(project)) {
+      log("debug", "opening the repo's space first", { main });
+      run("space.new", { name: project.name, folder: main });
+    }
+    log("debug", "launch", { folder, name, argv, promptMode, tabs });
+    run("space.new", { name, folder, ...(argv.length ? { argv, ...(prompt && !send ? { task: prompt } : {}) } : {}) });
+    // focused() can still be the window the picker was opened from just after space.new, so the new
+    // space and its first pane come from `herdr-app ls`: the space that wasn't there before.
+    const here = layout || tabs.length ? await findNewSpace(spacesBefore, name, folder) : null;
+    const space = here?.space ?? focused()?.space;
+    // Found before the layout's split panes exist, which also start in this folder.
+    const terminal = send ? await findNewTerminal(known, folder) : null;
+    if (layout) {
+      if (!here) log("error", `layout "${layout.name}" skipped: couldn't find the new space`, { name });
+      else try { await buildLayout(layout, folder, here.pane); } catch (e) { log("error", `layout "${layout.name}": ${e.message}`); }
+    }
+    for (const cmd of tabs) run("tab.new", { space, name: cmd.split(/\s+/)[0], folder, argv: ["sh", "-c", cmd] });
+    return terminal;
+  });
+  if (send) await sendWhenReady(terminal, folder, prompt);
+}
+
+const sleep = (s) => rawExec("sleep", [String(s)]);
+
+async function liveTerminals() {
+  const r = await hc(["ls", "--json"]);
+  return (JSON.parse(r.stdout).terminals ?? []).filter((t) => t.state === "live");
+}
+
+/** The terminal space.new just made: new since `known`, starting in `folder`. The address isn't known yet, so this has to list
+ *  every terminal; it asks quickly at first (the terminal usually shows up at once) and backs off, for about 10 s in all. */
+async function findNewTerminal(known, folder) {
+  const until = Date.now() + 10000;
+  for (let wait = 0.2; Date.now() < until; wait = Math.min(wait * 1.5, 1)) {
+    const t = (await liveTerminals()).find((x) => !known.has(x.address) && x.cwd === folder);
+    if (t) return t.address;
+    await sleep(wait);
+  }
+  return null;
+}
+
+const SHELLS = new Set(["bash", "sh", "zsh", "fish", "dash"]);
+
+/** Types `text` into the new space's terminal once its agent is ready. An agent herdr reports a
+ *  status for must be idle (or done); one it doesn't know (hermes) is ready once it has been the
+ *  foreground program for 6 s. A blocked one (a trust dialog, say) is left alone. */
+async function sendWhenReady(terminal, folder, text) {
+  if (!terminal) return log("error", "prompt not sent: couldn't find the new terminal", { folder });
+  const started = Date.now();
+  for (;;) {
+    // One call about this terminal alone (status and foreground program together), not a list of every terminal.
+    const r = await hc(["get", terminal, "--json"]);
+    let t = null;
+    if (r.code === 0) { try { t = JSON.parse(r.stdout); } catch {} }
+    else if (r.code === 3) t = false;
+    if (t === false || t?.state === "finished") return log("error", "prompt not sent: the terminal ended", { terminal });
+    const waited = Date.now() - started;
+    // `hc get` reports status as a record ({ app, state }); `hc ls` as the bare state word.
+    const status = (typeof t?.status === "object" ? t.status?.state : t?.status) ?? null;
+    const fg = t?.foreground?.name ?? null;
+    log("debug", "waiting to send prompt", { terminal, status, agent: t?.agent, foreground: fg, waited });
+    if (status === "blocked") return log("error", "prompt not sent: the agent is waiting on you", { terminal });
+    if (status === "idle" || status === "done") break;
+    if (t && !status && fg && !SHELLS.has(fg) && waited > 6000) break;
+    if (waited > 30000) return log("error", "prompt not sent: the agent never became ready", { terminal, foreground: fg });
+    await sleep(waited > 8000 ? 1 : 0.5);
+  }
+  const r = await hc(["send", terminal, text]);
+  log("debug", "sent prompt", { terminal, code: r.code });
+  if (r.code !== 0) log("error", `hc send failed: ${r.stderr.split("\n")[0]}`, { terminal });
+}
+
+/** `git worktree list`; -z (git 2.36+) keeps odd folder names intact, older gits fall back to plain porcelain. */
+async function worktreeList(folder) {
+  const r = await git(folder, ["worktree", "list", "--porcelain", "-z"]);
+  return r.code === 0 ? r : git(folder, ["worktree", "list", "--porcelain"]);
+}
+
+/** Maps `items` through async `fn`, at most `limit` at a time; results keep the order of `items`. */
+export async function mapLimit(items, limit, fn) {
+  const results = new Array(items.length);
+  let next = 0, failed = false;
+  // After one failure the others take no more items.
+  const worker = async () => {
+    for (let i = next++; i < items.length && !failed; i = next++) {
+      try { results[i] = await fn(items[i], i); } catch (e) { failed = true; throw e; }
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, worker));
+  return results;
+}
+
+/** A project's branch, number of changed files and number of linked worktrees, for the picker; null when the folder
+ *  isn't a readable checkout. Three quick git calls. */
+export async function gitSummary(folder) {
+  try {
+    // The two calls don't depend on each other, so they run side by side.
+    const listing = worktreeList(folder);
+    listing.catch(() => {}); // if status fails first, nobody awaits this one
+    const st = await git(folder, ["status", "--porcelain", "-b"]);
+    if (st.code !== 0) return null; // not a checkout: don't wait for the other call
+    const list = await listing;
+    const [head, ...changed] = st.stdout.split("\n").filter(Boolean);
+    // "## main...origin/main [ahead 1]", "## HEAD (no branch)", "## No commits yet on main"
+    const branch = (head ?? "").replace(/^## (No commits yet on |Initial commit on )?/, "").split("...")[0].replace(/ \[.*\]$/, "");
+    return { branch, dirty: changed.length, worktrees: list.code === 0 ? Math.max(0, parseWorktrees(list.stdout).length - 1) : 0 };
+  } catch { return null; }
+}
+
+/** The repo's linked worktrees (not the main checkout): { path, branch, dirty, merged, space }.
+ *  merged: the branch is already in <remote>/<base>, so removing it loses nothing. */
+export async function listWorktrees(project) {
+  const folder = projectFolder(project);
+  const r = await worktreeList(folder);
+  if (r.code !== 0) throw new Error(out({ stdout: r.stderr }) || "git worktree list failed");
+  const found = parseWorktrees(r.stdout).slice(1).filter((w) => w.path && !w.prunable);
+  let base = null;
+  try { base = await baseRef(folder, project.git); } catch {}
+  const open = spaces().filter((s) => !s.machine);
+  // git reports real paths; a space opened through a symlink (macOS /var, a linked home) has the other spelling.
+  // Each open space's real path is resolved once, and only if some worktree has no exact match.
+  let bySpelling = null; // real path → space, built once and only if some worktree has no exact match
+  const spaceAt = async (path) => {
+    const exact = open.find((s) => s.folder === path);
+    if (exact) return exact;
+    bySpelling ??= mapLimit(open, 4, async (s) => [await realPath(s.folder), s]).then((all) => new Map(all.reverse()));
+    return (await bySpelling).get(path) ?? null;
+  };
+  // Each worktree's checks are independent, so a few run at once.
+  return mapLimit(found, 4, async ({ path, branch, locked }) => {
+    const [dirty, merged] = await Promise.all([
+      git(path, ["status", "--porcelain"]).then((s) => out(s) !== ""),
+      base && branch ? git(folder, ["merge-base", "--is-ancestor", branch, base]).then((m) => m.code === 0) : false,
+    ]);
+    return { path, branch, dirty, merged, locked, space: await spaceAt(path) };
+  });
+}
+
+/** Removes one worktree (git refuses when it has uncommitted changes), its branch when merged,
+ *  and closes the space showing it. */
+export async function removeWorktree(project, wt) {
+  const folder = projectFolder(project);
+  const r = await git(folder, ["worktree", "remove", wt.path]);
+  if (r.code !== 0) throw new Error(`${wt.branch ?? wt.path}: ${out({ stdout: r.stderr }).split("\n")[0]}`);
+  if (wt.branch && wt.merged) await git(folder, ["branch", "-d", wt.branch]);
+  if (wt.space) run("space.close", { id: wt.space.id });
+}
+
+/** The git checkouts under `root`, at most `depth` folders down. Throws when the folder can't be read. */
+export async function scanFolder(root, depth) {
+  const [command, args, maxDepth] = scanCommand(depth);
+  const r = await exec(command, [...args, root, String(maxDepth)], { timeout: 20000 });
+  // find exits non-zero over one unreadable subfolder and still lists the rest: only an empty answer is a failure.
+  if (r.code !== 0 && !r.stdout) throw new Error(r.stderr.split("\n")[0] || "couldn't read the folder");
+  return parseScan(r.stdout, root);
+}
+
+/** The branch new work starts from in a checkout nobody has configured: the remote's default branch, else main or
+ *  master when one exists, else the branch checked out now. null when git can't say. */
+export async function detectBase(folder, remote = "origin") {
+  try {
+    const head = await git(folder, ["symbolic-ref", "--quiet", "--short", `refs/remotes/${remote}/HEAD`]);
+    if (head.code === 0 && out(head).startsWith(`${remote}/`)) return out(head).slice(remote.length + 1);
+    for (const b of ["main", "master"]) {
+      for (const ref of [`refs/remotes/${remote}/${b}`, `refs/heads/${b}`]) if ((await git(folder, ["rev-parse", "--verify", "--quiet", ref])).code === 0) return b;
+    }
+    const current = await git(folder, ["symbolic-ref", "--quiet", "--short", "HEAD"]);
+    if (current.code === 0 && out(current)) return out(current);
+  } catch {}
+  return null;
+}
+
+/** Writes a file inside a repository, making its folder first. `expected` is the file as last read (null: new). */
+export async function writeRepoFile(path, text, expected) {
+  const dir = path.replace(/\/[^/]*$/, "");
+  const made = await exec("mkdir", ["-p", dir]);
+  if (made.code !== 0) throw new Error(made.stderr.split("\n")[0] || `couldn't create ${dir}`);
+  try { await writeTextFile(path, text, expected); } catch (e) {
+    // herdr may refuse to write outside its own folder: the shell can.
+    log("debug", `writeTextFile refused ${path}: ${e.message}`);
+    const r = await exec("sh", ["-c", 'printf %s "$2" > "$1"', "sh", path, text]);
+    if (r.code !== 0) throw new Error(r.stderr.split("\n")[0] || `couldn't write ${path}`);
+  }
+}

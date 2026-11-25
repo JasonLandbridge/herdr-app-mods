@@ -1,0 +1,6 @@
+{
+  "place": "none",
+  "size": 268,
+  "title": "Sidebar Overhaul",
+  "overlay": { "kind": "popup", "width": 280, "height": 360 }
+}

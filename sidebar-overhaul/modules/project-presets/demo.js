@@ -1,0 +1,17 @@
+// Documentation screenshots: `~/.config/herdr-app/data/project-presets.demo` (JSON) opens the picker
+// already in a given view, so each screen can be captured the same way every time. Absent by default.
+//   { "view": "list|edit|delete|name|worktrees|backup|duplicate|busy", "project": "api-gateway", "query": "apgw",
+//     "focus": "agent", "text": "fix login", "tick": true, "confirm": true, "notes": ["…"],
+//     "detail": true|false (show or hide the detail card), "layout": "agent-terminal" (a layout picked for the launch),
+//     "ask": "codex" (view edit on a saved template: sets its agent and presses Save, showing the apply-to-projects question),
+//     "steps": [["select", "docs"], ["activate", false], ["wait", 1]] (actions run in order after the view is set: see runDemoSteps) }
+import * as fs from "fs/promises";
+import { appHome } from "herdr";
+
+export async function readDemo() {
+  const path = `${appHome()}/data/project-presets.demo`;
+  try {
+    if (!(await fs.exists(path))) return null;
+    return JSON.parse(await fs.readFile(path, "utf8"));
+  } catch { return null; }
+}
