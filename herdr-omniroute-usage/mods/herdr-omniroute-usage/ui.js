@@ -79,8 +79,10 @@ function accountDetails(account, provider, model, t) {
   const credits = account.credits.toSorted((a, b) => (Date.parse(a.expiresAt) || Infinity) - (Date.parse(b.expiresAt) || Infinity));
   const next = credits.find((credit) => !Number.isFinite(Date.parse(credit.expiresAt)) || Date.parse(credit.expiresAt) > now);
   const status = quotaStatus(account, model.stale, now);
+  const inactive = account.active === false;
   return v_flex().gap(4).pl(8).py(4)
-    .child(str(account.label, t.foreground).font_semibold())
+    .when(inactive, (e) => e.opacity(0.55))
+    .child(str(inactive ? `${account.label} (inactive)` : account.label, t.foreground).font_semibold())
     .when(status, (e) => e.child(str(status, t.muted)))
     .when(account.quotaError, (e) => e.child(str(`Quota fetch failed: ${account.quotaError}`, t.ansi3)))
     .children((account.balances ?? []).map((balance) => str(`Balance: ${balanceText(balance)}`, t.muted)))

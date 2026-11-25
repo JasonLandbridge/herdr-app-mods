@@ -155,6 +155,7 @@ test("Codex Mixed uses counter-based quota and excludes the disabled account fro
   });
   try {
     const [{ accounts }] = await loadUsage(config);
+    assert.deepEqual(accounts.map(({ id, active }) => [id, active]), [["working", true], ["disabled", false], ["weekly-only", true]]);
     assert.deepEqual(summarizeCodexFooter(accounts, ["session", "weekly"]), { value: 68.5, reporting: 1, total: 2 });
     assert.equal(accounts[1].windows[0].remaining, 0);
     assert.deepEqual(summarizeCodexFooter(accounts, ["session"]), { value: 75, reporting: 1, total: 2 });
