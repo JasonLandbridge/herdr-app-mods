@@ -92,6 +92,15 @@ test("strict config parsing supports local and remote machine entries", () => {
   assert.throws(() => parseConfig(JSON.stringify({ ...config, machines: { ...config.machines, local: undefined } })), /machines must define local/);
 });
 
+test("custom project folders are optional per-machine, safe, and unique", () => {
+  const custom = { ...config, machines: { ...config.machines, local: { ...config.machines.local, customProjects: ["/srv/projects/Repo", "/home/dev/Archive"] } } };
+  assert.deepEqual(parseConfig(JSON.stringify(custom)).machines.local.customProjects, custom.machines.local.customProjects);
+  assert.throws(() => validateConfig({ ...custom, machines: { ...custom.machines, local: { ...custom.machines.local, customProjects: "bad" } } }), /must be an array/);
+  assert.throws(() => validateConfig({ ...custom, machines: { ...custom.machines, local: { ...custom.machines.local, customProjects: ["/srv/Repo", "/srv/Repo"] } } }), /must be unique/);
+  assert.throws(() => validateConfig({ ...custom, machines: { ...custom.machines, local: { ...custom.machines.local, customProjects: ["/srv/../Repo"] } } }), /cannot contain \.\./);
+});
+
+
 test("declarative lookups preserve local/remote identity and return fallback when absent", () => {
   assert.equal(lookupOption(config, "layout"), "expanded");
   assert.equal(lookupOption(config, "missing", "fallback"), "fallback");

@@ -13,6 +13,7 @@ function values(config, machine, home) {
     projects: entry?.locations?.projects ?? "~",
     keepUpToDate: machineOption(config, machine, "keepUpToDate"),
     handoffRule: machineOption(config, machine, "handoffRule"),
+    customProjects: [...(entry?.customProjects ?? [])],
   };
 }
 
@@ -118,12 +119,37 @@ export class MachineSettingsController {
           if ((!entryExists || changed.includes(key)) && !await directoryCheck(exec, machine, draft[key])) throw new Error(`${key === "chats" ? "Chats" : "Projects"} folder does not exist on ${machine ?? "this computer"}.`);
         }
       }
+      if (changed.includes("customProjects")) {
+        const added = new Set();
+        let userHome = machine == null ? this.home : "";
+        const previous = this.config?.machines?.[localKey(machine)]?.customProjects ?? [];
+        for (const path of draft.customProjects) {
+          let folder = validatePath(path);
+          if (!absolute(folder)) {
+            if (!connected) throw new Error(`Reconnect ${machine} or use absolute custom project paths while offline.`);
+            if (!userHome) {
+              const result = await exec("sh", ["-c", 'printf %s "$HOME"'], { on: machine });
+              userHome = result.code === 0 ? result.stdout.trim() : "";
+            }
+            if (!absolute(userHome)) throw new Error("Could not resolve the machine’s home folder.");
+            folder = `${userHome.replace(/\/$/, "")}${folder.slice(1)}` || "/";
+          }
+          folder = folder.replace(/([^/\\:])[\\/]+$/, "$1");
+          if (added.has(folder)) continue;
+          if (connected && !previous.includes(folder) && !await directoryCheck(exec, machine, folder)) {
+            throw new Error(`Custom project folder does not exist on ${machine ?? "this computer"}: ${folder}`);
+          }
+          added.add(folder);
+        }
+        draft.customProjects = [...added];
+      }
       const result = await persist((config) => {
         const key = localKey(machine);
         const entry = config.machines[key] ?? { worktreeDirectory: draft.worktreeDirectory, locations: {}, projects: { pinned: [], hidden: [], unpinned: [], listed: [] } };
         entry.locations ??= {};
         for (const location of ["chats", "projects"]) if (changed.includes(location)) entry.locations[location] = draft[location];
         if (changed.includes("worktreeDirectory")) entry.worktreeDirectory = draft.worktreeDirectory;
+        if (changed.includes("customProjects")) entry.customProjects = draft.customProjects;
         entry.options ??= {};
         for (const option of ["keepUpToDate", "handoffRule"]) if (changed.includes(option)) entry.options[option] = draft[option] === true;
         config.machines[key] = entry;

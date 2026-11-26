@@ -68,8 +68,12 @@ const gpuiBase = {
   Input: { new: () => host.gpuiKit.div() },
 };
 
+let pickerConfig;
+let pickerExec;
 const herdr = {
   ...host.herdr,
+  readTextFile: async () => pickerConfig ? JSON.stringify(pickerConfig) : null,
+  exec: (...args) => (pickerExec ?? host.herdr.exec)(...args),
   writeTextFile: async () => {},
   props: () => testProps,
   closeOverlay: () => null,
@@ -84,6 +88,7 @@ mock.module("herdr", () => herdr);
 
 const { default: SidebarOptions } = await import("./main.js");
 const { MachineSettingsController } = await import("./machine-settings.js");
+const { default: OmpSpacePicker } = await import("../../../omp-space-picker/mods/omp-space-picker/main.js");
 function controller() {
   const view = new SidebarOptions();
   view.handle = {};
@@ -297,4 +302,45 @@ test("machine settings close confirms dirty drafts from other tabs and Escape is
   keyDown({ key: "escape" }, { notify() {}, stop_propagation() { stopped.push(true); } });
   assert.deepEqual(stopped, [true]);
   assert.ok(findNode(view.render({ notify() {}, spawn() {} }), "machine-close-confirm"));
+});
+
+test("extra project folders saved from a machine tab appear in the picker and launch there", async () => {
+  host.reset({ machines: [{ name: "remote", state: "connected" }] });
+  const view = controller();
+  view.config = { config: structuredClone(savedConfig) };
+  view.machineSettings = machineController("remote", ["remote"]);
+  view.prepareMachineInputs();
+  const tasks = [];
+  const cx = { ...eventContext(tasks), focus_handle: () => ({ focus() {} }), timer: { after() {} } };
+  view.machineInputs.customProject.set_value("/srv/External Repo/");
+  trigger(view.render(cx), "machine-customProject-add", "click", {}, cx);
+  const checks = [];
+  const { config } = await saveMachine(view.machineSettings, async (_command, args, options) => {
+    checks.push([args.at(-1), options.on]);
+    return { code: 0 };
+  });
+  assert.deepEqual(checks, [["/srv/External Repo", "remote"]]);
+  assert.deepEqual(config.machines.remote.customProjects, ["/srv/External Repo"]);
+  assert.equal(config.machines.local.customProjects, undefined);
+  assert.equal(config.machines.remote.locations.projects, "/workspaces");
+  pickerConfig = config;
+  pickerExec = async (command, args, options) => {
+    assert.deepEqual([command, args, options.on], ["test", ["-d", "/srv/External Repo"], "remote"]);
+    return { code: 0 };
+  };
+  try {
+    const picker = new OmpSpacePicker();
+    picker.init({}, cx);
+    await Promise.all(tasks.splice(0));
+    picker.input.set_value("external repo");
+    picker.input.handlers.get("change")({}, cx);
+    trigger(picker.render(), "omp-space-0", "click", {}, cx);
+    await Promise.all(tasks.splice(0));
+    assert.deepEqual(host.calls.run, [{ name: "space.new", args: { machine: "remote", folder: "/srv/External Repo", argv: ["bash", "-lc", "exec omp"] } }]);
+    host.state.spaces = [{ id: "existing", name: "External Repo", machine: "remote", folder: "/srv/External Repo/", active: true }];
+    assert.equal(findNode(picker.render(), "omp-space-1"), null, "an open space replaces the saved-folder row");
+  } finally {
+    pickerConfig = undefined;
+    pickerExec = undefined;
+  }
 });

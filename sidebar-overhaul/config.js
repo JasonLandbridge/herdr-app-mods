@@ -141,6 +141,17 @@ export function validateConfig(config) {
         if (own(entry, "icon")) validateIcon(entry.icon, `machine ${key}.projects.${group} entry icon`);
       }
     }
+    if (own(machine, "customProjects")) {
+      if (!Array.isArray(machine.customProjects)) fail(`machine ${key}.customProjects must be an array`);
+      const paths = new Set();
+      for (const path of machine.customProjects) {
+        validateText(path, `machine ${key}.customProjects entries must be non-empty paths`);
+        if (!path.startsWith("/") && !/^[A-Za-z]:[\\/]/.test(path)) fail(`machine ${key}.customProjects entries must be absolute`);
+        if (path.split(/[\\/]/).includes("..")) fail(`machine ${key}.customProjects entries cannot contain .. segments`);
+        if (paths.has(path)) fail(`machine ${key}.customProjects entries must be unique`);
+        paths.add(path);
+      }
+    }
   }
 
   if (!isObject(config.repositories)) fail("repositories must be an object");

@@ -161,6 +161,9 @@ export default class SidebarOptions extends View {
       });
       return [key, input];
     }));
+    const customProjectInput = InputState.new({ placeholder: "/srv/projects/Repo or ~/projects/Repo" });
+    customProjectInput.on("submit", (_event, cx) => this.addCustomProject(customProjectInput, cx));
+    this.machineInputs.customProject = customProjectInput;
   }
 
   selectMachine(machine, cx) {
@@ -173,21 +176,36 @@ export default class SidebarOptions extends View {
     cx.notify();
   }
 
+  addCustomProject(input, cx, path = input.value()) {
+    if (this.machineSaving || this.machineInputs.customProject !== input) return;
+    const value = path.trim();
+    if (!value) return;
+    const current = this.machineSettings.draft().customProjects;
+    if (!current.includes(value)) this.machineSettings.set("customProjects", [...current, value]);
+    input.set_value("");
+    this.machineNotice = "";
+    cx.notify();
+  }
+
   openMachineFolder(key, cx) {
     const editor = this.machineSettings;
     const machine = editor.machine;
     if (!editor.connected() || this.machineSaving) return;
-    const pick = new FolderPick({ value: editor.draft()[key] || "~", machine,
+    const pick = new FolderPick({ value: key === "customProject" ? "~" : editor.draft()[key] || "~", machine,
       home: machine == null && key !== "worktreeDirectory" ? home() : null,
       done: (value, cx) => {
         const apply = path => {
           if (this.machineFolderPick?.pick !== pick) return;
-          editor.set(key, path, machine);
+          if (key === "customProject") this.addCustomProject(this.machineInputs.customProject, cx, path);
+          else {
+            editor.set(key, path, machine);
+            this.machineInputs[key].set_value(path);
+          }
           this.machineFolderPick = null;
           this.machineNotice = "";
-          this.machineInputs[key].set_value(path);
+          cx.notify();
         };
-        if (key === "worktreeDirectory" && /^~(?=\/|$)/.test(value)) cx.spawn(async (cx) => {
+        if (key === "worktreeDirectory" && /^~(?=\/|$)/.test(value)) cx.spawn(async cx => {
           try {
             const result = machine == null ? { code: 0, stdout: home() } : await exec("sh", ["-c", 'printf %s "$HOME"'], { on: machine });
             if (result.code !== 0 || !result.stdout.trim()) throw new Error("Could not resolve the machine’s home folder.");
@@ -286,7 +304,22 @@ export default class SidebarOptions extends View {
         .child(h_flex().gap(8).items_center()
           .child(button("machine-hook-settings", "Worktree hooks…", () => openOverlay({ mod: "sidebar-overhaul", kind: "dialog", width: 640, height: 620, props: { view: "worktree-settings", machine } }), saving))
           .child(note("Setup commands by repository."))))
-      .when(!this.setup && machine == null, el => el.child(h_flex().child(button("run-setup", "Run setup again", cx => { this.setup = true; cx.notify(); }, saving))));
+      .when(!this.setup && machine == null, el => el.child(h_flex().child(button("run-setup", "Run setup again", cx => { this.setup = true; cx.notify(); }, saving))))
+      .child(v_flex().pt(8).gap(6).border_t_1().border_color(t.border)
+        .child(heading("Extra project folders"))
+        .child(note("Remember folders outside Projects; they appear in Ctrl+Shift+B for this machine."))
+        .when(!saving, el => el.child(h_flex().items_center().gap(6)
+          .child(Input.new(this.machineInputs.customProject).h(30).px(8).flex_1().min_w(0).rounded(6).border_1().border_color(t.input).bg(t.background))
+          .child(button("machine-customProject-add", "Add", cx => this.addCustomProject(this.machineInputs.customProject, cx)))
+          .child(button("machine-customProject-browse", "Browse…", cx => this.openMachineFolder("customProject", cx), !online || saving)))
+          .when(online && this.machineFolderPick?.key === "customProject", el => el.child(this.machineFolderPick.pick.view(t, cx))))
+        .children(draft.customProjects.map((path, index) => h_flex().id(`custom-project-${index}`).h(28).px(8).items_center().gap(8)
+          .child(div().flex_1().min_w(0).truncate().text_color(t.foreground).child(path))
+          .child(button(`custom-project-remove-${index}`, "Remove", cx => {
+            editor.set("customProjects", editor.draft().customProjects.filter((_, i) => i !== index));
+            this.machineNotice = "";
+            cx.notify();
+          }, saving)))));
   }
 
 

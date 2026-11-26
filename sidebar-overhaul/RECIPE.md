@@ -109,6 +109,10 @@ Left to right. All colours are theme names (`canvas`, `chrome`, `background`,
     Changes, ↑ pushes (click twice), ↓ pulls.
   - The + on a computer opens `over9k-new-menu`: start a CLI or an agent, resume
     a past chat, or start Pi on another model.
+  - In **Machine settings → Extra project folders**, add or browse to individual
+    folders outside the Projects folder, then save. **Ctrl+Shift+B** lists them
+    alongside open spaces. Selecting a saved folder opens OMP on its machine;
+    if its space is already open, the picker opens a new OMP tab there.
   - Pin an agent in a + (for Pi, a model): a little bot left of the + starts it
     in one click, on that device and all its spaces.
   - Clicking an agent's chip shows or hides what it started. Clicking a
