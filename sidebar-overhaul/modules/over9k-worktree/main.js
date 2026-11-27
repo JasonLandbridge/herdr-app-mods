@@ -385,6 +385,7 @@ export default class Worktree extends View {
 
   async remove() {
     if (this.removed) return this.cleanBranches();
+    if (this.checkoutUnregistered) return this.finishRemoval();
     const s = this.space();
     if (!s?.id && !this.closeRequested) return "The worktree space is not available to close safely.";
     if (this.closeRequested) {
@@ -442,6 +443,24 @@ export default class Worktree extends View {
     const force = this.dirty || mods.length > 0;
     const r = await git(checkout.main, ["worktree", "remove", ...(force ? ["--force"] : []), checkout.path], this.on, 600_000);
     if (!r.ok) return r.err || "git worktree remove failed.";
+    this.checkoutUnregistered = true;
+    return this.finishRemoval();
+  }
+
+  async finishRemoval() {
+    const { id, path } = this.removalCheckout;
+    if (spaces().some(space => space.id === id || (space.machine ?? null) === (this.on ?? null) && space.folder?.replace(/\/+$/, "") === path))
+      return "A space for this checkout is still open. Close it before retrying removal.";
+    const result = await exec("sh", ["-c", `
+      if [ -L "$1" ] || [ -e "$1/.git" ] || [ -L "$1/.git" ] || { [ -e "$1" ] && [ ! -d "$1" ]; }; then
+        printf '%s\\n' 'The checkout path was replaced or is a Git checkout again; refusing to delete it.' >&2
+        exit 1
+      fi
+      case "$1" in /*/?*) ;; *) exit 1 ;; esac
+      if [ -d "$1" ]; then rm -rf -- "$1" || exit 1; fi
+      [ ! -e "$1" ] && [ ! -L "$1" ]
+    `, "worktree-remove", path], { on: this.on, timeout: 600_000 });
+    if (result.code !== 0) return `Git removed the worktree registration, but could not delete ${path}. ${result.stderr?.trim() || "Close any IDE using it and retry removal."}`;
     this.removed = true;
     return this.cleanBranches();
   }
@@ -578,7 +597,7 @@ export default class Worktree extends View {
           : remove
             ? !r.linked
               ? "This is the repository's main checkout, not a worktree."
-              : this.removed ? "Worktree removed. You can retry any remaining branch cleanup." : `Closes the space and deletes ${tilde(r.top, this.userHome)}. Branches stay unless selected below.`
+              : this.removed ? "Worktree removed. You can retry any remaining branch cleanup." : `Deletes the entire checkout at ${tilde(r.top, this.userHome)}, including ignored files such as .idea. Branches stay unless selected below.`
             : this.sourceLabel ? `Start from ${this.sourceLabel}. Uncommitted edits stay in the original checkout.` : "Creates the checkout under the configured machine worktree root.";
     const affectedAgentRows = (this.affectedAgents ?? []).map((agent, index) => {
       const detail = this.closePlan?.agentStatuses?.find((item) => item.address === agent.address);

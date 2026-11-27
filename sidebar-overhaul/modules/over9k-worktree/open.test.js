@@ -1,6 +1,9 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { mock } from "bun:test";
+import { mkdtemp, mkdir, rm, stat, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { createNativeTestHost } from "../over9k/native-test-host.js";
 import { buildClosePlan } from "./close-plan.js";
 
@@ -287,4 +290,46 @@ test("worktree removal waits for close acknowledgement and retries only the revi
     assert.equal(await removal, "");
     assert.deepEqual(removals, [["worktree", "remove", folder]]);
   } finally { execOverride = undefined; viewProps = { overlay: "worktree-dialog" }; }
+});
+
+test("removal cleans residual IDE files without deleting a replacement checkout", async () => {
+  const root = await mkdtemp(join(tmpdir(), "herdr-remove-"));
+  const folder = join(root, "checkout");
+  const spaces = [{ id: "feature", name: "feature", folder, tabs: [] }];
+  host.reset({ spaces });
+  viewProps = { action: "remove", space: "feature" };
+  const view = new Worktree();
+  view.repo = { main: join(root, "repo"), top: folder, linked: true };
+  view.closePlan = buildClosePlan({ spaces: ["feature"] }, { spaces });
+  view.unpushed = [];
+  view.removeBranch = "feature";
+  let gitRemovals = 0;
+  execOverride = async (command, args) => {
+    if (command === "herdr-app") {
+      host.state.spaces = [];
+      return { code: 0, stdout: "{}" };
+    }
+    if (command === "sh") {
+      const result = Bun.spawnSync([command, ...args]);
+      return { code: result.exitCode, stderr: result.stderr.toString() };
+    }
+    if (args[0] === "symbolic-ref") return { code: 0, stdout: "feature" };
+    if (args[0] === "worktree" && args[1] === "remove") gitRemovals++;
+    return { code: 0, stdout: "" };
+  };
+  try {
+    await mkdir(join(folder, ".idea"), { recursive: true });
+    await writeFile(join(folder, ".idea", "workspace.xml"), "IDE state");
+    await writeFile(join(folder, ".git"), "replacement checkout");
+    assert.match(await view.remove(), /refusing to delete/);
+    assert.equal((await stat(join(folder, ".idea", "workspace.xml"))).isFile(), true);
+    await rm(join(folder, ".git"));
+    assert.equal(await view.remove(), "");
+    await assert.rejects(stat(folder), { code: "ENOENT" });
+    assert.equal(gitRemovals, 1);
+  } finally {
+    execOverride = undefined;
+    viewProps = { overlay: "worktree-dialog" };
+    await rm(root, { recursive: true, force: true });
+  }
 });
