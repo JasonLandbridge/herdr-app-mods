@@ -7,6 +7,7 @@ import {
   WORKTREE_LABELS,
   availabilityChecks,
   commandFieldKey,
+  githubRuleIdentity,
   normalizeRoot,
   parseArgvText,
   parseConfig,
@@ -164,7 +165,7 @@ export default class WorktreeHookSettings extends View {
   ensureInputs() {
     if (!this.form) return;
     this.ensureInput("rule-machine", this.form.machine, "This computer");
-    this.ensureInput("rule-repo", this.form.repo, "/absolute/repository/root");
+    this.ensureInput("rule-repo", this.form.repo, "/absolute/repository/root or github:owner/repo");
     this.form.commands.forEach((command, index) => {
       this.ensureInput(commandFieldKey(index, "name"), command.name, "setup name");
       this.ensureInput(commandFieldKey(index, "argv"), command.argv, '["bash", "/path/to/setup.sh"]');
@@ -360,11 +361,11 @@ export default class WorktreeHookSettings extends View {
     const matches = all.filter((term) => {
       const labels = labelMap(term);
       return terminalBelongsToMachine(term, project.machine ?? null)
-        && normalizeRoot(labels[WORKTREE_LABELS.repo]) === normalizeRoot(project.repo);
+        && normalizeRoot(labels[WORKTREE_LABELS.ruleRepo] ?? labels[WORKTREE_LABELS.repo]) === normalizeRoot(project.repo);
     });
     const cwds = [...new Set(matches.map((term) => labelMap(term)[WORKTREE_LABELS.cwd]).filter(Boolean))];
     return cwds
-      .map((cwd) => selectSetupResult(matches, { repo: project.repo, cwd }))
+      .map((cwd) => selectSetupResult(matches, { ruleRepo: project.repo, cwd }))
       .filter(Boolean)
       .sort((a, b) => rowTime(b) - rowTime(a));
   }
@@ -380,7 +381,7 @@ export default class WorktreeHookSettings extends View {
     const project = this.savedProject();
     if (!project || !term?.address) return;
     const fresh = this.setupRows(project).find((row) => row.address === term.address);
-    const guard = retryGuard(fresh, { repo: project.repo, cwd: labelMap(fresh)[WORKTREE_LABELS.cwd] });
+    const guard = retryGuard(fresh, { repo: project.repo, ruleRepo: project.repo, cwd: labelMap(fresh)[WORKTREE_LABELS.cwd] });
     if (!guard.ok) {
       this.error = guard.reason;
       cx.notify();
@@ -496,7 +497,7 @@ export default class WorktreeHookSettings extends View {
     return v_flex().flex_none().gap(5).p(8).rounded(7).border_1().border_color(t.border)
       .child(h_flex().items_center().child(div().flex_1().font_semibold().text_color(t.foreground).child("Availability checks"))
         .child(div().text_size(10.5).text_color(t.dim).child(result.checked_only ? "checks only" : "")))
-      .child(check("Root", result.root))
+      .when(Boolean(result.root), el => el.child(check("Root", result.root)))
       .children(result.commands.map((command, index) => v_flex().flex_none().gap(3)
         .child(check(`${index + 1}. ${command.name || "Unnamed"} executable`, command.executable))
         .when(Boolean(command.script), (el) => el.child(check(`   explicit script ${command.script_operand}`, command.script)))))
@@ -514,7 +515,7 @@ export default class WorktreeHookSettings extends View {
         const labels = labelMap(term);
         const status = labels[WORKTREE_LABELS.status] ?? "unknown";
         const reason = labels[WORKTREE_LABELS.exitreason] ?? "";
-        const guard = retryGuard(term, { repo: project.repo, cwd: labels[WORKTREE_LABELS.cwd] });
+        const guard = retryGuard(term, { repo: project.repo, ruleRepo: project.repo, cwd: labels[WORKTREE_LABELS.cwd] });
         return v_flex().id(`setup-result-${index}`).flex_none().gap(4).p(8).rounded(7).border_1().border_color(t.border)
           .child(h_flex().items_center()
             .child(div().flex_1().text_color(t.foreground).truncate().child(labels[WORKTREE_LABELS.cwd] ?? term.address))
@@ -549,7 +550,7 @@ export default class WorktreeHookSettings extends View {
         .child(this.button(t, "remove-rule", "Remove rule", (cx) => this.removeRule(cx))))
       .child(h_flex().gap(8).children([
         ...(this.machine === undefined ? [this.inputField(t, "Machine (blank = this computer)", "rule-machine", "Use a machine name known to Herdr.")] : []),
-        this.inputField(t, "Repository root", "rule-repo", "Absolute path; matching is normalized."),
+        this.inputField(t, "Repository root or GitHub repo", "rule-repo", "Absolute path uses exact/remote-origin matching; enter github:owner/repo for an explicit machine-scoped GitHub rule."),
       ]))
       .child(this.commandsEditor(t, cx))
       .child(h_flex().gap(8)

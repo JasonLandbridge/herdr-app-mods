@@ -53,7 +53,7 @@ test("the tab bar menu opens the custom worktree dialog and starts new spaces wi
   view.handle = {};
   const root = view.render(host.context());
   await trigger(root, "worktree", "click", {}, host.context());
-  assert.deepEqual(host.calls.openOverlay, [{ mod: "sidebar-overhaul", kind: "dialog", width: 460, height: 280,
+  assert.deepEqual(host.calls.openOverlay, [{ mod: "sidebar-overhaul", kind: "dialog", width: 560, height: 420,
     props: { space: "remote", folder: "/workspaces/Reaparr/src", action: "new", view: "worktree" } }]);
   await trigger(root, "space", "click", {}, host.context());
   assert.deepEqual(host.calls.run, [{ name: "space.new", args: { argv: ["bash", "-lc", "exec omp"] } }]);

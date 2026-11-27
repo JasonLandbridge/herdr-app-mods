@@ -1,3 +1,9 @@
+export function githubRuleIdentity(repo) {
+  return typeof repo === "string" && /^github:[\w-]+\/[\w.-]+$/i.test(repo)
+    ? repo.slice(7).replace(/\.git$/i, "").toLowerCase()
+    : "";
+}
+
 export const CONFIG_VERSION = 2;
 
 // These labels are written by the visible worktree gate. They are deliberately
@@ -7,6 +13,7 @@ export const WORKTREE_LABELS = Object.freeze({
   cwd: "over9k.worktree.cwd",
   status: "over9k.worktree.status",
   exitreason: "over9k.worktree.exitreason",
+  ruleRepo: "over9k.worktree.rule_repo",
 });
 
 const SHELLS = new Set(["sh", "bash", "zsh", "dash", "fish", "ksh", "mksh", "yash", "csh", "tcsh", "nu", "elvish", "xonsh"]);
@@ -69,8 +76,14 @@ export function validateConfig(config, knownMachines) {
     } else if (machines && !machines.some((entry) => (entry?.name ?? null) === machine)) {
       errors.push(`${label}.machine is not a known machine.`);
     }
-    if (typeof project.repo !== "string" || !project.repo.trim() || project.repo.includes("\0") || !absoluteRoot(project.repo)) {
-      errors.push(`${label}.repo must be an absolute path without NUL.`);
+    if (typeof project.repo !== "string" || !project.repo.trim() || project.repo.includes("\0")) {
+      errors.push(`${label}.repo must be an absolute path or GitHub owner/repo without NUL.`);
+    } else if (githubRuleIdentity(project.repo)) {
+      const key = `${machine ?? ""}\0github:${githubRuleIdentity(project.repo)}`;
+      if (seen.has(key)) errors.push(`${label} duplicates another project for the same machine and GitHub repository.`);
+      seen.add(key);
+    } else if (!absoluteRoot(project.repo)) {
+      errors.push(`${label}.repo must be an absolute path or GitHub owner/repo without NUL.`);
     } else {
       const key = `${machine ?? ""}\0${normalizeRoot(project.repo)}`;
       if (seen.has(key)) errors.push(`${label} duplicates another project for the same machine and repository.`);
@@ -193,22 +206,35 @@ async function shellCheck(execFn, args, on) {
  */
 export async function availabilityChecks(project, execFn) {
   const on = project?.machine ?? null;
-  const root = await shellCheck(execFn, ["-c", 'test -d "$1"', "worktree-hooks", project?.repo ?? ""], on);
+  const root = githubRuleIdentity(project?.repo) ? null : await shellCheck(execFn, ["-c", 'test -d "$1"', "worktree-hooks", project?.repo ?? ""], on);
+  const commands = await checkHookCommands(project?.hooks?.on_created ?? [], on, execFn);
+  return {
+    ok: (root?.ok ?? true) && commands.every(command => command.executable.ok && (command.script?.ok ?? true)),
+    root, commands, checked_only: true,
+  };
+}
+
+async function checkHookCommands(hooks, on, execFn) {
   const commands = [];
-  for (const hook of project?.hooks?.on_created ?? []) {
+  for (const hook of hooks) {
     const executable = await shellCheck(execFn, ["-c", 'command -v "$1"', "worktree-hooks", hook.argv?.[0] ?? ""], on);
     const operand = scriptOperand(hook.argv);
     const script = operand === null
       ? null
-      : await shellCheck(execFn, ["-c", 'case "$1" in "~") set -- "$HOME" ;; "~/"*) set -- "$HOME/${1#~/}" ;; esac; test -f "$1"', "worktree-hooks", operand], on);
+      : await shellCheck(execFn, ["-c", 'test -f "$1" && test -r "$1"', "worktree-hooks", operand], on);
     commands.push({ name: hook.name, executable, script, script_operand: operand });
   }
-  return {
-    ok: root.ok && commands.every((command) => command.executable.ok && (command.script === null || command.script.ok)),
-    root,
-    commands,
-    checked_only: true,
-  };
+  return commands;
+}
+
+export async function hookPreflight(hooks, machine, execFn) {
+  if (!hooks.length) return "";
+  const commands = await checkHookCommands(hooks, machine, execFn);
+  const host = machine ?? "this computer";
+  return commands.flatMap(command => [
+    ...(!command.executable.ok ? [`${command.name}: executable unavailable on ${host} (${command.executable.detail})`] : []),
+    ...(command.script && !command.script.ok ? [`${command.name}: script missing or unreadable on ${host}: ${command.script_operand} (${command.script.detail})`] : []),
+  ]).join("\n");
 }
 
 function setupLabels(term) {
@@ -217,7 +243,9 @@ function setupLabels(term) {
 
 function matchesSetup(term, expected) {
   const labels = setupLabels(term);
-  return normalizeRoot(labels[WORKTREE_LABELS.repo]) === normalizeRoot(expected?.repo)
+  return (expected?.ruleRepo === undefined
+    ? normalizeRoot(labels[WORKTREE_LABELS.repo]) === normalizeRoot(expected?.repo)
+    : (labels[WORKTREE_LABELS.ruleRepo] ?? labels[WORKTREE_LABELS.repo]) === expected.ruleRepo)
     && normalizeRoot(labels[WORKTREE_LABELS.cwd]) === normalizeRoot(expected?.cwd)
     && SETUP_STATUSES.has(labels[WORKTREE_LABELS.status]);
 }
@@ -250,7 +278,7 @@ export function retryGuard(term, expected) {
   if (!term) return { ok: false, reason: "The setup terminal is no longer available." };
   if (term.state !== "live") return { ok: false, reason: "The setup terminal has ended." };
   const labels = setupLabels(term);
-  if (normalizeRoot(labels[WORKTREE_LABELS.repo]) !== normalizeRoot(expected?.repo) || normalizeRoot(labels[WORKTREE_LABELS.cwd]) !== normalizeRoot(expected?.cwd)) {
+  if (!matchesSetup(term, expected)) {
     return { ok: false, reason: "That terminal belongs to a different checkout." };
   }
   if (labels[WORKTREE_LABELS.status] !== "failed") return { ok: false, reason: "Setup is not waiting for a retry." };

@@ -11,6 +11,8 @@ import {
   saveConfig,
   selectSetupResult,
   updateCommandField,
+  validateConfig,
+  githubRuleIdentity,
 } from "./settings.js";
 
 const hooks = [{ name: "Initialize", argv: ["bash", "/home/me/init.sh"], timeout_seconds: 1800 }];
@@ -32,7 +34,7 @@ test("invalidconfig rejects malformed JSON, relative roots, bad argv and non-pos
     projects: [{ machine: null, repo: "relative", hooks: { on_created: [{ name: "", argv: [""], timeout_seconds: 0 }] } }],
   }), [null]);
   assert.equal(invalid.config, null);
-  assert.match(invalid.errors.join(" "), /repo must be an absolute path/);
+  assert.match(invalid.errors.join(" "), /repo must be an absolute path or GitHub owner\/repo/);
   assert.match(invalid.errors.join(" "), /name must be a non-empty string/);
   assert.match(invalid.errors.join(" "), /argv must start with a non-empty executable/);
   assert.match(invalid.errors.join(" "), /timeout_seconds must be a positive integer/);
@@ -50,6 +52,18 @@ test("invalidconfig rejects malformed JSON, relative roots, bad argv and non-pos
 
   assert.deepEqual(parseArgvText("[\"bash\",\"script.sh\"]"), ["bash", "script.sh"]);
   assert.throws(() => parseArgvText("bash script.sh"), /JSON array/);
+});
+
+test("GitHub owner/repo rules are validated and duplicates are machine scoped", () => {
+  assert.equal(githubRuleIdentity("github:Acme/Widget.git"), "acme/widget");
+  assert.equal(githubRuleIdentity("Acme/Widget"), "");
+  assert.equal(githubRuleIdentity("github:Acme/../Widget"), "");
+  const rules = { version: 2, projects: [
+    { machine: "remote", repo: "github:Acme/Widget", hooks: { on_created: [] } },
+    { machine: "remote", repo: "github:acme/widget", hooks: { on_created: [] } },
+    { machine: null, repo: "github:acme/widget", hooks: { on_created: [] } },
+  ] };
+  assert.match(validateConfig(rules, [{ name: "remote" }, { name: null }]).join(" "), /duplicates another project for the same machine and GitHub repository/);
 });
 test("editor command fields update the command draft slots used by save", () => {
   const draft = [{ name: "old", argv: "[]", timeout: "1" }];
@@ -87,6 +101,13 @@ test("resultselection chooses the newest exact repo/cwd setup terminal and ignor
   assert.equal(selectSetupResult([exactFailed, exactSucceeded], { repo: "/work/Reaparr", cwd: "/tmp/wt" }), exactSucceeded);
 });
 
+test("setup result can be selected by explicit rule identity", () => {
+  const explicit = { address: "t-explicit", labels: { ...labels("/work/Reaparr", "/tmp/wt", "succeeded"), [WORKTREE_LABELS.ruleRepo]: "github:acme/reaparr" } };
+  const pathRule = { address: "t-path", labels: labels("/work/Reaparr", "/tmp/wt", "failed") };
+  assert.equal(selectSetupResult([pathRule, explicit], { repo: "/work/Reaparr", ruleRepo: "github:acme/reaparr", cwd: "/tmp/wt" }), explicit);
+  assert.equal(selectSetupResult([pathRule, explicit], { repo: "/work/Reaparr", ruleRepo: "/work/Reaparr", cwd: "/tmp/wt" }), pathRule);
+});
+
 test("retryguard allows only the failed matching terminal while its own shell is idle", () => {
   const expected = { repo: "/work/Reaparr", cwd: "/tmp/wt" };
   const safe = { address: "t1", state: "live", pid: 4, foreground: { pid: 4, argv: ["bash"] }, labels: labels(expected.repo, expected.cwd, "failed", "hook_exit_7") };
@@ -117,4 +138,16 @@ test("availability checks inspect roots, executables and explicit script operand
     { command: "sh", target: "bash", options: { on: null } },
     { command: "sh", target: "/home/me/init.sh", options: { on: null } },
   ]);
+});
+
+test("a GitHub rule checks its script on the target without treating the repository as a directory", async () => {
+  const targets = [];
+  const result = await availabilityChecks({ ...config.projects[0], machine: "builder", repo: "github:owner/project" }, async (_, args, { on }) => {
+    assert.equal(on, "builder");
+    targets.push(args.at(-1));
+    return { code: args.at(-1) === "bash" ? 0 : 1 };
+  });
+  assert.deepEqual(targets, ["bash", "/home/me/init.sh"]);
+  assert.equal(result.ok, false);
+  assert.equal(result.commands[0].script.ok, false);
 });

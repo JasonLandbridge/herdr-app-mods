@@ -147,6 +147,16 @@ for (const machine of [null, "unraid-dev"]) test(`machine menu opens selected ma
     props: { view: "options", page: "machines", computer: machine } }]);
 });
 
+test("New worktree opens the repository picker for the machine that was clicked", () => {
+  host.reset();
+  activeProps = { tab: "machine", target: { machine: "unraid-dev" }, overlay: "menu-overlay" };
+  const view = new Menu();
+  view.init(activeProps, cx());
+  chooseMenuItem(view, "New worktree");
+  assert.deepEqual(host.calls.openOverlay.at(-1)?.props, { view: "machine-worktree", machine: "unraid-dev" });
+  assert.deepEqual(host.calls.run, []);
+});
+
 test("move picker exposes local and remote destination rows in its allocated scroll area", () => {
   host.reset({
     spaces: [{ id: "source", tabs: [{ id: "source-tab" }] }, { id: "target", name: "Local target", folder: "/local" }, { id: "remote/target", name: "Remote target", folder: "/remote", machine: "remote" }],

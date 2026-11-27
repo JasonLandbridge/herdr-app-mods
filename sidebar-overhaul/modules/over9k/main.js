@@ -17,6 +17,7 @@ import { spaces, machines, panes, agents, terminals, setAgentOrder, run, openOve
 import { codexTitle, agentTask, isCodex, sentenceCase } from "./agent-name.js";
 import { getSidebarConfig, updateSidebarConfig, currentSidebarConfig } from "../../config-store.js";
 import { lookupLocation, lookupMachineOption } from "../../config.js";
+import { WORKTREE_LABELS, normalizeRoot } from "../over9k-worktree/worktree-hooks.js";
 async function sidebarConfig() {
   return currentSidebarConfig() ?? (await getSidebarConfig({
     home: home(), machines: machines(), options: { ...shared("sidebar.options") },
@@ -3178,7 +3179,7 @@ export default class Spaces extends View {
         .hover(s => s.bg(t.hover))
         .on_mouse_down("right", (_e, cx) => {
           cx.stop_propagation();
-          openOverlay({ mod: "sidebar-overhaul", kind: "popup", width: 260, height: 72, props: { tab: "machine", target: { machine: m }, view: "menu" } });
+          openOverlay({ mod: "sidebar-overhaul", kind: "popup", width: 260, height: 90, props: { tab: "machine", target: { machine: m }, view: "menu" } });
         })
         .on_click((_e, cx) => {
           folded ? this.folded.delete(m) : this.folded.add(m);
@@ -3374,6 +3375,7 @@ export default class Spaces extends View {
     const color = this.frame.colors[w.id];
     // Home (here or on another computer) stays uncoloured.
     const fill = !color || this.title(w) === "~" ? t.foreground : color.startsWith("#") ? color : (MARK[color] ?? t[color]);
+    const setup = this.frame.failedSetups?.get(JSON.stringify([w.machine ?? null, normalizeRoot(w.folder)]));
     return v_flex()
       .relative()
       .id(`space-${w.id}`)
@@ -3425,6 +3427,17 @@ export default class Spaces extends View {
           .when(Boolean(tree), el => el.pl(16).child(svg("mods/workspace-chrome/branch.svg").size(13).text_color(t.dim)))
           .child(div().flex_shrink(0).max_w(150).truncate().text_color(fill).child(this.title(w)))
           .when(Boolean(g?.web) && !tree && this.frame.options.github, el => el.child(this.ghLink(g, t)))
+          .when(Boolean(setup), el => el.child(div().id(`worktree-setup-${w.id}`).flex_none().cursor_pointer().text_size(11).text_color(t.blocked)
+            .tooltip("Open setup terminal")
+            .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
+            .on_click((_e, cx) => {
+              cx.stop_propagation();
+              const pane = this.frame.ps.find(p => p.terminal === setup.address);
+              if (pane) {
+                if (!w.active) run("space.select", { id: w.id });
+                run("pane.focus", { pane: pane.pane });
+              } else run("terminal.show", { terminal: setup.address });
+            }).child("Setup failed")))
           .when(Boolean(g), el => el.children(this.counts(g, t, (cx) => this.showChanges({ id: w.id }, cx))))
           .child(this.agentFold(w, t))
           .child(this.tail(g, tree, w.name, t, this.hoverSpace === w.id && w.folder))
@@ -3583,6 +3596,15 @@ export default class Spaces extends View {
     diagnostics.stage("grouping", { spaces: sp.length, panes: ps.length, agents: ag.length, terminals: terms.length, projects: this.projects.length });
     const groups = this.assign(sp, ps);
     this.frame = { sp, ps, ag, terms, focus, focusedTerminal: focus?.shown ?? focus?.terminal ?? focus?.agent, colors: kept, ms: machines(), names: shared("projects.names") ?? {}, options: { ...OPTIONS, ...config.options }, byPane: new Map(ag.map((a) => [a.pane, a])), groups, groupMeta: this.groupMeta };
+    const failedSetups = new Map();
+    for (const term of terms) {
+      const cwd = term.labels?.[WORKTREE_LABELS.cwd];
+      if (term.state !== "live" || !cwd || term.labels[WORKTREE_LABELS.status] !== "failed") continue;
+      const machine = term.address.includes("/") ? term.address.split("/", 1)[0] : null;
+      const key = JSON.stringify([machine, normalizeRoot(cwd)]);
+      if (!failedSetups.has(key) || term.created_ms > failedSetups.get(key).created_ms) failedSetups.set(key, term);
+    }
+    this.frame.failedSetups = failedSetups;
     const liveAgents = this.canonicalLiveAgents(sp, ps, ag, terms);
     this.frame.liveAgents = liveAgents;
     this.indexLiveAgents(liveAgents, groups);

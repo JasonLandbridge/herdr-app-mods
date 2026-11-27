@@ -335,6 +335,18 @@ function reportStatus(addresses, status) {
 function renderSidebar(view) {
   return view.render(host.context());
 }
+
+test("failed worktree setup opens its terminal and does not mark a different space", () => {
+  const view = makeSidebar({ viewMode: "space" });
+  const setup = host.state.terminals.find(term => term.address === "t-feature");
+  setup.labels = { "over9k.worktree.status": "failed", "over9k.worktree.cwd": setup.cwd };
+  const root = renderSidebar(view);
+  assert.equal(textOf(findNode(root, "worktree-setup-local-feature")), "Setup failed");
+  assert.equal(findNode(root, "worktree-setup-local-alpha"), null);
+  trigger(root, "worktree-setup-local-feature", "click", {}, host.context());
+  assert.deepEqual(host.calls.run, [{ name: "space.select", args: { id: "local-feature" } }, { name: "pane.focus", args: { pane: "p-feature" } }]);
+});
+
 function renderDiagnostics() {
   const current = JSON.parse(host.storage.getItem("over9k.renderDiagnostics"));
   const history = JSON.parse(host.storage.getItem("over9k.renderDiagnostics.history"));
@@ -389,11 +401,11 @@ test("space + preserves Scripts target while active pane is elsewhere", () => {
     props: { space: "local-alpha", folder: "/home/jason/Scripts", machine: null, view: "new-menu" } }]);
 });
 
-for (const machine of [null, "unraid-dev"]) test(`machine heading opens settings menu for ${machine ?? "local"}`, () => {
+for (const machine of [null, "unraid-dev"]) test(`machine heading opens its action menu for ${machine ?? "local"}`, () => {
   const view = makeSidebar({ viewMode: "space" });
   const root = renderSidebar(view);
   trigger(root, `machine-${machine ?? "local"}`, "mouse_down:right", {}, host.context());
-  assert.deepEqual(host.calls.openOverlay, [{ mod: "sidebar-overhaul", kind: "popup", width: 260, height: 72,
+  assert.deepEqual(host.calls.openOverlay, [{ mod: "sidebar-overhaul", kind: "popup", width: 260, height: 90,
     props: { tab: "machine", target: { machine }, view: "menu" } }]);
   assert.deepEqual(host.calls.run, []);
 });

@@ -31,12 +31,32 @@ function configuredDestination(config, machine, repo, branch) {
   catch (error) { return { error: `Invalid worktree root for machine ${key}: ${String(error?.message ?? error)}` }; }
 }
 
+function githubIdentity(url) {
+  return /^(?:https:\/\/github\.com\/|ssh:\/\/git@github\.com\/|git@github\.com:)([\w-]+\/[\w.-]+?)\/?$/i
+    .exec(url?.trim())?.[1].replace(/\.git$/i, "").toLowerCase();
+}
+
+function githubRuleIdentity(repo) {
+  return typeof repo === "string" && /^github:[\w-]+\/[\w.-]+$/i.test(repo)
+    ? repo.slice(7).replace(/\.git$/i, "").toLowerCase()
+    : "";
+}
+
 function matchingProject(project, machine, main) {
   return isObject(project)
     && Object.prototype.hasOwnProperty.call(project, "machine")
     && project.machine === (machine ?? null)
     && typeof project.repo === "string"
-    && normalizeRoot(project.repo) === normalizeRoot(main);
+    && (githubRuleIdentity(main) ? githubRuleIdentity(project.repo) === githubRuleIdentity(main) : !githubRuleIdentity(project.repo))
+    && (githubRuleIdentity(main) || normalizeRoot(project.repo) === normalizeRoot(main));
+}
+
+function matchingGithubProjects(projects, machine, identity) {
+  return projects.filter(project => isObject(project) && project.machine === (machine ?? null) && githubRuleIdentity(project.repo) === identity);
+}
+function hookPlanForProject(text, machine, project) {
+  const plan = hookPlan(text, machine, project.repo);
+  return plan.matched ? { ...plan, ruleRepo: project.repo } : plan;
 }
 
 export function hookPlan(text, machine, main) {
@@ -65,7 +85,35 @@ export function hookPlan(text, machine, main) {
       return invalid(`hooks.on_created[${index}].timeout_seconds must be a positive integer.`);
     hooks.push({ name: hook.name, argv: [...hook.argv], timeout_seconds: hook.timeout_seconds });
   }
-  return { hooks, matched: true };
+  return { hooks, matched: true, ruleRepo: project.repo };
+}
+
+export async function resolveHookPlan(text, machine, main, readOrigin, origin) {
+  const exact = hookPlan(text, machine, main);
+  if (!text || exact.matched || "error" in exact) return exact;
+  const config = JSON.parse(text);
+  const projects = config.projects.filter(project => project?.machine === (machine ?? null) && typeof project.repo === "string");
+  const explicit = projects.filter(project => githubRuleIdentity(project.repo));
+  if (!projects.length) return exact;
+  let identity;
+  try { identity = githubIdentity(origin ?? await readOrigin(main)); }
+  catch (error) { return { hooks: [], matched: false, error: `Could not read GitHub origin for ${main}: ${String(error?.message ?? error)}` }; }
+  if (!identity && explicit.length) return { hooks: [], matched: false, error: `Could not determine GitHub origin for ${main}.` };
+  if (!identity) return exact;
+  const matches = matchingGithubProjects(explicit, machine, identity);
+  if (matches.length > 1) return invalid("multiple explicit GitHub rules match the same machine and repository.");
+  if (matches.length) return hookPlanForProject(text, machine, matches[0]);
+  const pathCandidates = projects.filter(project => !githubRuleIdentity(project.repo));
+  let match;
+  for (const project of pathCandidates) {
+    let projectIdentity;
+    try { projectIdentity = githubIdentity(await readOrigin(project.repo)); }
+    catch { continue; }
+    if (projectIdentity !== identity) continue;
+    if (match) return invalid("multiple projects on this machine have the same GitHub origin.");
+    match = project;
+  }
+  return match ? hookPlanForProject(text, machine, match) : exact;
 }
 
 export function shellQuote(value) {
@@ -80,16 +128,18 @@ export const WORKTREE_LABELS = Object.freeze({
   cwd: "over9k.worktree.cwd",
   status: "over9k.worktree.status",
   exitreason: "over9k.worktree.exitreason",
+  ruleRepo: "over9k.worktree.rule_repo",
 });
 
 function labelSetupLines(metadata) {
   if (!metadata || typeof metadata.repo !== "string" || typeof metadata.cwd !== "string") return [];
   const repo = shellQuote(`${WORKTREE_LABELS.repo}=${metadata.repo}`);
+  const ruleRepo = typeof metadata.ruleRepo === "string" ? shellQuote(`${WORKTREE_LABELS.ruleRepo}=${metadata.ruleRepo}`) : "";
   const cwd = shellQuote(`${WORKTREE_LABELS.cwd}=${metadata.cwd}`);
   return [
     "label_gate() {",
     "  [ -n \"${HC_TERMINAL_ID:-}\" ] || return 0",
-    `  hc label "$HC_TERMINAL_ID" ${repo} ${cwd} "${WORKTREE_LABELS.status}=$1" "${WORKTREE_LABELS.exitreason}=$2" >/dev/null 2>&1 || true`,
+    `  hc label "$HC_TERMINAL_ID" ${repo} ${cwd} ${ruleRepo} "${WORKTREE_LABELS.status}=$1" "${WORKTREE_LABELS.exitreason}=$2" >/dev/null 2>&1 || true`,
     "}",
   ];
 }
@@ -152,6 +202,7 @@ export function hookGateRetryScript(hooks, requestedArgv, metadata) {
   const labels = labelSetupLines(metadata);
   return [
     ...hookSetupLines(hooks, metadata),
+    ...(metadata?.cwd ? [`cd ${shellQuote(metadata.cwd)} || { printf '%s\\n' 'Cannot enter the setup checkout.' >&2; exit 125; }`] : []),
     ...(labels.length ? [labelGate("retrying", "manual_retry")] : []),
     "if ! run_hooks; then",
     "  exit 125",
@@ -182,20 +233,23 @@ export function hookGateArgv(hooks, requestedArgv, metadata) {
 
 const branchSlug = (branch) => branch.replace(/[^A-Za-z0-9._-]+/g, "-").replace(/^-+|-+$/g, "");
 
-export async function createWorktree({ branch, repo, machine, config, existingDestinations, pathExists, tab, requestedArgv, git, readHooks, runSpace }) {
+export async function createWorktree({ branch, repo, machine, config, existingDestinations, pathExists, tab, requestedArgv, git, readHooks, runSpace, sourceCommit }) {
   if (!branch) return "Type a branch name.";
-  const destination = configuredDestination(config, machine, repo.main, branch);
+  const destination = configuredDestination(config, machine, repo.name ?? repo.main, branch);
   if (destination.error) return destination.error;
   const path = destination.path;
   if (hasDestinationCollision(path, existingDestinations)) return `Worktree destination already exists: ${path}`;
   if (pathExists && await pathExists(path)) return `Worktree destination already exists: ${path}`;
   const hookPlan = await readHooks({ machine: machine ?? null, main: repo.main });
   if (hookPlan.error) return hookPlan.error;
-  const launchArgv = hookGateArgv(hookPlan.hooks, requestedArgv, { repo: repo.main, cwd: path });
+  const launchArgv = hookGateArgv(hookPlan.hooks, requestedArgv, { repo: repo.main, cwd: path, ruleRepo: hookPlan.ruleRepo });
   const exists = (await git(repo.main, ["show-ref", "--verify", "--quiet", `refs/heads/${branch}`], machine)).ok;
-  const add = exists ? ["worktree", "add", path, branch] : ["worktree", "add", "-b", branch, path, "HEAD"];
+  if (exists && sourceCommit) return `Branch already exists: ${branch}`;
+  const add = exists ? ["worktree", "add", path, branch] : sourceCommit
+    ? ["worktree", "add", "--no-track", "-b", branch, "--", path, sourceCommit]
+    : ["worktree", "add", "-b", branch, path, "HEAD"];
   const result = await git(repo.top, add, machine, 600_000);
   if (!result.ok) return result.err || "git worktree add failed.";
-  runSpace({ folder: path, machine: machine ?? "", tab, argv: launchArgv });
+  await runSpace({ folder: path, machine: machine ?? "", tab, argv: launchArgv });
   return "";
 }

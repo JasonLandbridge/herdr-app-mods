@@ -4,6 +4,7 @@ import NewMenu from "./modules/over9k-new-menu/main.js";
 import Menu from "./modules/over9k-menu/main.js";
 import Options from "./modules/over9k-options/main.js";
 import Worktree from "./modules/over9k-worktree/main.js";
+import MachineWorktree from "./modules/over9k-worktree/machine-worktree.js";
 import WorktreeSettings from "./modules/over9k-worktree-settings/main.js";
 import Close from "./modules/over9k-close/main.js";
 import Handoff from "./modules/over9k-handoff/main.js";
@@ -25,6 +26,7 @@ const views = {
   "new-menu": NewMenu,
   options: Options,
   worktree: Worktree,
+  "machine-worktree": MachineWorktree,
   "worktree-settings": WorktreeSettings,
   close: Close,
   handoff: Handoff,

@@ -4,8 +4,29 @@ import { mkdtemp, mkdir, readFile, stat, symlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
-import { createWorktree, hookGateRetryScript, hookGateScript, hookPlan, WORKTREE_LABELS } from "./worktree-hooks.js";
+import { createWorktree, hookGateRetryScript, hookGateScript, hookPlan, resolveHookPlan, WORKTREE_LABELS } from "./worktree-hooks.js";
 
+test("explicit GitHub rules resolve by machine and retain path exact precedence", async () => {
+  const text = JSON.stringify({ version: 2, projects: [
+    { machine: "remote", repo: "github:Acme/Widget", hooks: { on_created: [{ name: "Explicit", argv: ["true"], timeout_seconds: 1 }] } },
+    { machine: "remote", repo: "/work/Widget", hooks: { on_created: [{ name: "Exact", argv: ["true"], timeout_seconds: 1 }] } },
+  ] });
+  const exact = await resolveHookPlan(text, "remote", "/work/Widget", async () => "git@github.com:acme/widget.git");
+  assert.equal(exact.hooks[0].name, "Exact");
+  const explicit = await resolveHookPlan(text, "remote", "/other/path", async () => "git@github.com:ACME/Widget.git");
+  assert.equal(explicit.hooks[0].name, "Explicit");
+  assert.equal(explicit.ruleRepo, "github:Acme/Widget");
+  assert.equal((await resolveHookPlan(text, null, "/other/path", async () => "git@github.com:acme/widget.git")).matched, false);
+});
+
+test("GitHub rule origin lookup failures are reported rather than treated as no hooks", async () => {
+  const text = JSON.stringify({ version: 2, projects: [{ machine: null, repo: "github:acme/widget", hooks: { on_created: [] } }] });
+  const failed = await resolveHookPlan(text, null, "/work/checkout", async () => { throw new Error("git unavailable"); });
+  assert.match(failed.error, /Could not read GitHub origin/);
+  const noOrigin = await resolveHookPlan(text, null, "/work/checkout", async () => "");
+  assert.equal(noOrigin.matched, false);
+  assert.match(noOrigin.error, /Could not determine GitHub origin/);
+});
 async function fixture() {
   const userHome = await mkdtemp(join(tmpdir(), "herdr-worktree-"));
   const repo = { main: join(userHome, "Reaparr"), top: join(userHome, "Reaparr"), name: "Reaparr" };
@@ -69,7 +90,7 @@ test("hook gates execute lifecycle labels without letting label failures affect 
   await mkdir(fakeBin, { recursive: true });
   await symlink("/usr/bin/touch", join(fakeBin, "hc"));
   const environment = { HC_TERMINAL_ID: "fixture-terminal", PATH: `${fakeBin}:${process.env.PATH ?? ""}` };
-  const metadata = { repo: "/repo", cwd: "/checkout" };
+  const metadata = { repo: "/repo", cwd: checkoutPath };
   const first = await runGate(
     ["sh", "-c", hookGateScript([{ name: "setup", argv: ["sh", "-c", "exit 7"], timeout_seconds: 10 }], ["sh", "-c", "true"], metadata), "herdr-label-gate"],
     checkoutPath,
@@ -83,7 +104,7 @@ test("hook gates execute lifecycle labels without letting label failures affect 
 
   const retry = await runGate(
     ["sh", "-c", hookGateRetryScript([{ name: "setup", argv: ["sh", "-c", "true"], timeout_seconds: 10 }], ["sh", "-c", "true"], metadata), "herdr-label-retry"],
-    checkoutPath,
+    userHome,
     "",
     environment,
   );
@@ -337,12 +358,18 @@ test("Git registers a new checkout directly under the configured machine root", 
     const result = await git(repo.main, args);
     assert.ok(result.ok, result.err);
   }
+  const linked = join(userHome, "source-worktree");
+  assert.ok((await git(repo.main, ["worktree", "add", "-b", "source", linked])).ok);
+  assert.ok((await git(linked, ["commit", "--allow-empty", "-m", "Unpushed source commit"])).ok);
+  const sourceCommit = (await git(linked, ["rev-parse", "HEAD"])).out.trim();
+  assert.ok((await git(linked, ["commit", "--allow-empty", "-m", "Moved after preview"])).ok);
   let opening;
-  const result = await createWorktree({ branch: "fixes", repo, config, machine: null,
-    pathExists: exists, git, readHooks: () => plan([]), runSpace: args => { opening = args; } });
+  const result = await createWorktree({ branch: "fixes", repo: { ...repo, top: linked }, config, machine: null,
+    sourceCommit, pathExists: exists, git, readHooks: () => plan([]), runSpace: args => { opening = args; } });
   assert.equal(result, "");
   const expected = join(userHome, "WORKTREES", "Reaparr-fixes");
   assert.equal(opening.folder, expected);
+  assert.equal((await git(expected, ["rev-parse", "HEAD"])).out.trim(), sourceCommit);
   const registered = await git(repo.main, ["worktree", "list", "--porcelain"]);
   assert.ok(registered.ok, registered.err);
   assert.ok(registered.out.split("\n").includes(`worktree ${expected}`));

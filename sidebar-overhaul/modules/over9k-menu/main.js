@@ -108,7 +108,10 @@ function items(p, git) {
   const tg = p.target ?? {};
   switch (p.tab) {
     case "machine":
-      return [["Machine settings…", "machine.settings", { machine: tg.machine ?? null }]];
+      return [
+        ["New worktree…", "machine.worktree", { machine: tg.machine ?? null }],
+        ["Machine settings…", "machine.settings", { machine: tg.machine ?? null }],
+      ];
     case "pane": {
       // A kept sub-agent can go back under its parent, still running.
       const all = terminals();
@@ -169,6 +172,7 @@ function items(p, git) {
       return [
         ["Rename", "space.rename", { id: tg.id }],
         ...(git ? [["New worktree", "worktree", { space: tg.id, action: "new" }], ["Open worktree", "worktree", { space: tg.id, action: "open" }]] : []),
+        ...(git ? [["Run worktree setup…", "worktree", { space: tg.id, action: "setup" }]] : []),
         ...(git === "linked" ? [["Remove worktree", "worktree", { space: tg.id, action: "remove" }]] : []),
         ...copyItem(place(spaces().find((s) => s.id === tg.id))),
         ...folderItem(spaces().find((s) => s.id === tg.id)),
@@ -321,6 +325,7 @@ export function closeAsk(picked) {
 }
 
 function menuIcon(command) {
+  if (command === "machine.worktree") return "mods/workspace-chrome/git-branch.svg";
   if (command === "pane.handoff") return "mods/sidebar-overhaul/handoff.svg";
   if (command.startsWith("visibility.")) return "mods/workspace-chrome/pin-off.svg";
   const name = command === "folder.reveal" ? "folder" : command === "panes.group" ? "layers" : command === "panes.separate" ? "panel-right" : command === "project.rename" ? "square-pen" : command === "project.open" ? "plus" : command === "icon.paste" ? "square" : command === "icon.choose" ? "folder" : command === "icon.find" ? "search" : command === "icon.remove" ? "x" : command === "list.pin" ? "pin" : command.startsWith("list.") ? "pin-off" : command.endsWith(".close") || command === "close-ask" || command === "close-many" ? "x" : command.endsWith(".rename") ? "square-pen" : command.endsWith(".new") ? "plus" : command === "worktree" ? "git-branch" : command === "app.help" ? "terminal" : command === "app.theme" ? "settings" : command === "pane.split" ? "panel-right" : command === "pane.zoom" ? "square" : "terminal";
@@ -463,9 +468,10 @@ export default class Menu extends View {
       return;
     }
     closeOverlay(this.menuProps?.overlay);
-    if (it[1] === "worktree") openOverlay({ mod: "sidebar-overhaul", kind: "dialog", ...(it[2].action === "open" ? { width: 560, height: 480 } : { width: 440, height: 260 }), props: { view: "worktree", ...it[2] } });
+    if (it[1] === "worktree") openOverlay({ mod: "sidebar-overhaul", kind: "dialog", width: 560, height: it[2].action === "open" ? 480 : 420, props: { view: "worktree", ...it[2] } });
     else if (it[1] === "workspace.settings") openOverlay({ mod: "sidebar-overhaul", kind: "dialog", width: 780, height: 640, props: { view: "options", ...it[2] } });
     else if (it[1] === "machine.settings") openOverlay({ mod: "sidebar-overhaul", kind: "dialog", width: 780, height: 640, props: { view: "options", page: "machines", computer: it[2].machine } });
+    else if (it[1] === "machine.worktree") openOverlay({ mod: "sidebar-overhaul", kind: "dialog", width: 0.76, height: 0.76, props: { view: "machine-worktree", ...it[2] } });
     else if (it[1] === "close-ask") closeAsk(it[2]);
     else if (it[1] === "project.open") openOverlay({ mod: "sidebar-overhaul", kind: "popup", width: 340, height: 640, props: { view: "new-menu", ...it[2] } });
     else if (it[1] === "folder.reveal") exec("sh", ["-c", REVEAL, "sh", it[2].folder]).catch(() => null);

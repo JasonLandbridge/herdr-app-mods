@@ -375,7 +375,7 @@ export default class NewMenu extends View {
       // Worktrees belong to a space's repo: not on the computer's +.
       .when(!p.computer && (!p.folder || Boolean(this.repo)), el => el
         .child(div().h(1).mx(4).my(5).bg(t.border))
-        .child(this.row("worktree", svg("mods/workspace-chrome/branch.svg").size(14), "New worktree…", () => openOverlay({ mod: "sidebar-overhaul", kind: "dialog", width: 460, height: 280, props: { ...tree("new"), view: "worktree" } }), "", Boolean(space || p.folder)))
+        .child(this.row("worktree", svg("mods/workspace-chrome/branch.svg").size(14), "New worktree…", () => openOverlay({ mod: "sidebar-overhaul", kind: "dialog", width: 560, height: 420, props: { ...tree("new"), view: "worktree" } }), "", Boolean(space || p.folder)))
         .child(this.row("worktree-open", svg("mods/workspace-chrome/branch.svg").size(14), "Open worktree\u2026", () => openOverlay({ mod: "sidebar-overhaul", kind: "dialog", width: 560, height: 480, props: { ...tree("open"), view: "worktree" } }), "", Boolean(space || p.folder))))
       // Last, on the computer's +: Add spaces, by choosing a folder or by a scan
       // for every git and agent folder not listed.
