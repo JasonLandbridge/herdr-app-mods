@@ -167,6 +167,23 @@ async function repoOf(folder, on) {
   return { top: top.out, main, name: main === common.out ? leaf.replace(/\.git$/, "") : leaf, linked: main !== top.out };
 }
 
+const checkoutPath = path => typeof path === "string" ? path.replace(/[/]+$/, "") : "";
+
+async function registeredCheckout(repo, on) {
+  const result = await git(repo.main, ["worktree", "list", "--porcelain", "-z"], on);
+  if (!result.ok) throw new Error(result.err || "Could not read Git worktree registrations.");
+  const matching = result.out.split("\0\0").slice(1).map(block => block.split("\0"))
+    .filter(fields => fields[0] === `worktree ${repo.top}`);
+  if (matching.length !== 1) throw new Error("The space is not an exact registered linked worktree.");
+  const fields = matching[0];
+  if (fields.some(field => /^(?:bare|locked|prunable)(?: |$)/.test(field))) throw new Error("The worktree registration is not usable (bare, locked or prunable).");
+  const head = fields.find(field => field.startsWith("HEAD "))?.slice(5);
+  const ref = fields.find(field => field.startsWith("branch "))?.slice(7);
+  if (!/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(head ?? "") || (fields.includes("detached") ? ref !== undefined : !/^refs\/heads\/.+/.test(ref ?? "")))
+    throw new Error("Could not verify the worktree’s exact branch and commit.");
+  return { head, branch: ref?.slice("refs/heads/".length) ?? null };
+}
+
 export default class Worktree extends View {
   init(_props, cx) {
     this.on = this.space()?.machine;
@@ -206,7 +223,9 @@ export default class Worktree extends View {
         }
         const space = this.space();
         const creating = props()?.action === "new";
-        this.folder = props()?.folder || (creating || this.settingUp ? space?.folder : place(space)) || (this.settingUp ? null : this.userHome);
+        const removing = props()?.action === "remove";
+        this.folder = removing ? space?.folder
+          : props()?.folder || (creating || this.settingUp ? space?.folder : place(space)) || (this.settingUp ? null : this.userHome);
         if (!this.folder) throw new Error("The checkout is no longer available.");
         // The repo is set last: Enter does nothing until the warnings it consents to are known.
         const repo = await repoOf(this.folder, this.on);
@@ -220,13 +239,17 @@ export default class Worktree extends View {
           this.hookPlan = await this.readHooks({ machine: this.on ?? null, main: repo.main });
         }
         if (repo && this.settingUp) this.hookPlan = await this.readHooks({ machine: this.on ?? null, main: repo.main });
-        if (repo && props().action === "remove") {
-          this.dirty = (await git(repo.top, ["--no-optional-locks", "-c", "core.fsmonitor=false", "status", "--porcelain"], this.on)).out !== "";
+        if (removing) {
+          if (!space?.id || !repo?.linked || checkoutPath(this.folder) !== repo.top)
+            throw new Error("The selected space does not point to the root of a linked worktree.");
+          const registered = await registeredCheckout(repo, this.on);
+          this.removalCheckout = { id: space.id, name: space.name, path: repo.top, main: repo.main, ...registered };
+          const status = await git(repo.top, ["--no-optional-locks", "-c", "core.fsmonitor=false", "status", "--porcelain"], this.on);
+          if (!status.ok) throw new Error(status.err || "git status failed.");
+          this.dirty = Boolean(status.out);
           this.unpushed = (await submodules(repo.top, this.on)).unpushed;
           this.closePlan = closePlanFor(this.space()?.id);
           this.affectedAgents = this.closePlan?.affectedAgents ?? [];
-          const branch = await git(repo.top, ["symbolic-ref", "--quiet", "--short", "HEAD"], this.on);
-          this.removeBranch = branch.ok && branch.out ? branch.out : null;
           const origin = await git(repo.main, ["remote", "get-url", "--push", "origin"], this.on);
           this.removeOrigin = origin.ok ? origin.out : "";
         }
@@ -384,62 +407,57 @@ export default class Worktree extends View {
   }
 
   async remove() {
+    const checkout = this.removalCheckout;
+    if (!checkout) return "Reopen the removal dialog to verify the exact worktree first.";
     if (this.removed) return this.cleanBranches();
     if (this.checkoutUnregistered) return this.finishRemoval();
-    const s = this.space();
-    if (!s?.id && !this.closeRequested) return "The worktree space is not available to close safely.";
-    if (this.closeRequested) {
-      const current = await repoOf(this.repo.top, this.on);
-      if (!current?.linked || current.top !== this.removalCheckout.path || current.main !== this.removalCheckout.main)
-        return "The checkout changed. Reopen the removal dialog before retrying.";
-    }
-    const status = await git(this.repo.top, ["--no-optional-locks", "-c", "core.fsmonitor=false", "status", "--porcelain"], this.on);
+    const actualSpace = spaces().find(space => space.id === checkout.id);
+    if (!this.closeRequested && (!actualSpace || checkoutPath(actualSpace.folder) !== checkout.path || (actualSpace.machine ?? null) !== (this.on ?? null)))
+      return "The selected space changed. Reopen the removal dialog.";
+    const current = await repoOf(checkout.path, this.on);
+    if (!current?.linked || current.top !== checkout.path || current.main !== checkout.main)
+      return "The checkout changed. Reopen the removal dialog.";
+    const registered = await registeredCheckout(current, this.on);
+    if (registered.head !== checkout.head || registered.branch !== checkout.branch)
+      return "The worktree branch or commit changed. Reopen the removal dialog to review it.";
+    const status = await git(checkout.path, ["--no-optional-locks", "-c", "core.fsmonitor=false", "status", "--porcelain"], this.on);
     if (!status.ok) return status.err || "git status failed.";
     // git refuses a worktree with submodules unless forced, because their
     // history goes with it. The popup already showed what's at risk; only
     // risk that appeared since it opened gets one more warning.
-    const { mods, unpushed } = await submodules(this.repo.top, this.on);
+    const { mods, unpushed } = await submodules(checkout.path, this.on);
     const changed = (status.out && !this.dirty) || unpushed.some((name) => !this.unpushed.includes(name));
     this.dirty ||= status.out !== "";
     this.unpushed = [...new Set([...this.unpushed, ...unpushed])];
     if (changed) return "It changed since this opened. Review the warnings, then select Yes again.";
-    const actualSpace = s?.id ? spaces().find(candidate => candidate.id === s.id) : null;
-    const latestPlan = actualSpace && closePlanFor(actualSpace.id);
+    const latestPlan = !this.closeRequested && closePlanFor(checkout.id);
     const latestIdentity = latestPlan && closePlanIdentity(latestPlan);
     if (!this.closeRequested) {
-      if (!actualSpace) return "The worktree space is no longer available to close safely.";
       const previousIdentity = this.closePlan && closePlanIdentity(this.closePlan);
       this.closePlan = latestPlan;
       this.affectedAgents = latestPlan?.affectedAgents ?? [];
       if (!previousIdentity || previousIdentity !== latestIdentity) return "The affected terminals or agents changed. Review the complete list, then select Yes again.";
     }
-    const branch = await git(this.repo.top, ["symbolic-ref", "--quiet", "--short", "HEAD"], this.on);
-    if ((branch.ok && branch.out ? branch.out : null) !== this.removeBranch) {
-      this.removeBranch = branch.ok && branch.out ? branch.out : null;
-      this.deleteLocal = this.deleteOrigin = false;
-      return "The checked-out branch changed. Review the cleanup options again.";
-    }
-    if (this.deleteOrigin) {
-      const origin = await git(this.repo.main, ["remote", "get-url", "--push", "origin"], this.on);
-      if (!origin.ok || origin.out !== this.removeOrigin) return "The origin push destination changed. Reopen this dialog before removing it.";
-      const ref = `refs/heads/${this.removeBranch}`;
-      const remote = await git(this.repo.main, ["ls-remote", "--heads", "--", this.removeOrigin, ref], this.on, 30_000);
-      if (!remote.ok) return remote.err || "Could not verify the origin branch.";
-      const remoteBranch = remote.out.split("\n").map(line => line.split("\t")).find(([, name]) => name === ref);
-      this.originTip = remoteBranch?.[0];
-      if (this.originTip && !/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(this.originTip)) return "Could not verify the origin branch tip.";
+    if (this.deleteOrigin && checkout.branch) {
+      const remote = await this.readRemovalOrigin(`refs/heads/${checkout.branch}`);
+      if (remote.error) return remote.error;
+      if (this.closeRequested && this.originTip !== remote.tip) return "The origin branch tip changed. Turn off origin cleanup or reopen the dialog.";
+      this.originTip = remote.tip;
     }
     if (!this.closeRequested) {
-      if (closePlanIdentity(closePlanFor(actualSpace.id)) !== latestIdentity) return "The affected terminals or agents changed. Review the complete list, then select Yes again.";
+      const fresh = this.space();
+      if (fresh?.id !== checkout.id || checkoutPath(fresh.folder) !== checkout.path || (fresh.machine ?? null) !== (this.on ?? null))
+        return "The selected space changed. Reopen the removal dialog.";
+      if (closePlanIdentity(closePlanFor(checkout.id)) !== latestIdentity) return "The affected terminals or agents changed. Review the complete list, then select Yes again.";
       setShared("over9k.recovery", mergeRecoveryState(shared("over9k.recovery"), latestPlan?.affectedAgents ?? []));
-      try { await this.appCommand("space.close", { id: actualSpace.id, confirmed: true }); }
+      try { await this.appCommand("space.close", { id: checkout.id, confirmed: true }); }
       catch (error) { return `Could not confirm that the worktree space closed: ${String(error)}`; }
-      this.removalCheckout = { id: actualSpace.id, path: this.repo.top, main: this.repo.main };
       this.closeRequested = true;
     }
-    const checkout = this.removalCheckout;
-    const replacement = spaces().some(candidate => candidate.id === checkout.id || (candidate.machine ?? null) === (this.on ?? null) && candidate.folder?.replace(/\/+$/, "") === checkout.path);
+    const replacement = spaces().some(candidate => candidate.id === checkout.id || (candidate.machine ?? null) === (this.on ?? null) && checkoutPath(candidate.folder) === checkout.path);
     if (replacement) return "A space for this checkout is still open. Retry after it is closed.";
+    const final = await registeredCheckout(current, this.on);
+    if (final.branch !== checkout.branch || final.head !== checkout.head) return "The worktree branch or commit changed. Reopen the removal dialog to review it.";
     const force = this.dirty || mods.length > 0;
     const r = await git(checkout.main, ["worktree", "remove", ...(force ? ["--force"] : []), checkout.path], this.on, 600_000);
     if (!r.ok) return r.err || "git worktree remove failed.";
@@ -449,7 +467,7 @@ export default class Worktree extends View {
 
   async finishRemoval() {
     const { id, path } = this.removalCheckout;
-    if (spaces().some(space => space.id === id || (space.machine ?? null) === (this.on ?? null) && space.folder?.replace(/\/+$/, "") === path))
+    if (spaces().some(space => space.id === id || (space.machine ?? null) === (this.on ?? null) && checkoutPath(space.folder) === path))
       return "A space for this checkout is still open. Close it before retrying removal.";
     const result = await exec("sh", ["-c", `
       if [ -L "$1" ] || [ -e "$1/.git" ] || [ -L "$1/.git" ] || { [ -e "$1" ] && [ ! -d "$1" ]; }; then
@@ -465,18 +483,42 @@ export default class Worktree extends View {
     return this.cleanBranches();
   }
 
+  async readRemovalOrigin(ref) {
+    const origin = await git(this.removalCheckout.main, ["remote", "get-url", "--push", "origin"], this.on);
+    if (!origin.ok || origin.out !== this.removeOrigin) return { error: "The origin push destination changed. Branch kept." };
+    const remote = await git(this.removalCheckout.main, ["ls-remote", "--symref", "--", this.removeOrigin, "HEAD", ref], this.on, 30_000);
+    if (!remote.ok) return { error: remote.err || "Could not verify the origin branch." };
+    const defaultRef = remote.out.split("\n").find(line => line.startsWith("ref: ") && line.endsWith("\tHEAD"))?.slice(5, -5);
+    if (!defaultRef) return { error: "Could not verify the default branch on origin. Branch kept." };
+    if (defaultRef === ref) return { error: `Refusing to delete origin’s default branch (${ref.slice(11)}).` };
+    const tip = remote.out.split("\n").map(line => line.split("\t")).find(([, name]) => name === ref)?.[0];
+    if (tip !== undefined && !/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(tip)) return { error: "Could not verify the origin branch tip." };
+    return { tip };
+  }
+
   async cleanBranches() {
     const errors = [];
+    const { branch, head, main } = this.removalCheckout;
+    if (!branch) return "";
+    const ref = `refs/heads/${branch}`;
     if (this.deleteOrigin) {
-      const ref = `refs/heads/${this.removeBranch}`;
-      const push = this.originTip ? await git(this.repo.main, ["push", `--force-with-lease=${ref}:${this.originTip}`, "--", this.removeOrigin, `:${ref}`], this.on, 60_000) : { ok: true };
-      if (push.ok) this.deleteOrigin = false;
-      else errors.push(`Origin branch kept: ${push.err || "push failed"}`);
+      const remote = await this.readRemovalOrigin(ref);
+      if (remote.error) errors.push(`Origin branch kept: ${remote.error}`);
+      else if (remote.tip && remote.tip !== this.originTip) errors.push("Origin branch kept: its tip changed since review.");
+      else {
+        const push = remote.tip ? await git(main, ["push", `--force-with-lease=${ref}:${this.originTip}`, "--", this.removeOrigin, `:${ref}`], this.on, 60_000) : { ok: true };
+        if (push.ok) this.deleteOrigin = false;
+        else errors.push(`Origin branch kept: ${push.err || "push failed"}`);
+      }
     }
     if (this.deleteLocal) {
-      const result = await git(this.repo.main, ["branch", "-d", "--", this.removeBranch], this.on);
-      if (result.ok) this.deleteLocal = false;
-      else errors.push(`Local branch kept: ${result.err || "branch deletion failed"}`);
+      const tip = await git(main, ["rev-parse", "--verify", ref], this.on);
+      if (!tip.ok || tip.out !== head) errors.push("Local branch kept: its tip could not be verified or changed since review.");
+      else {
+        const result = await git(main, ["branch", "-d", "--", branch], this.on);
+        if (result.ok) this.deleteLocal = false;
+        else errors.push(`Local branch kept: ${result.err || "branch deletion failed"}`);
+      }
     }
     return errors.length ? `Worktree removed. ${errors.join(" · ")}` : "";
   }
@@ -588,16 +630,17 @@ export default class Worktree extends View {
     const remove = props()?.action === "remove";
     const s = this.space();
     const r = this.repo;
-    const title = remove ? `Remove worktree ${s?.name ?? ""}?` : `New worktree${r ? ` of ${r.name}` : ""}`;
+    const removeBranch = this.removalCheckout?.branch;
+    const title = remove ? `Remove worktree ${this.removalCheckout?.name ?? s?.name ?? ""}?` : `New worktree${r ? ` of ${r.name}` : ""}`;
     const detail =
       r === undefined
         ? "…"
         : r === null
-          ? `${this.folder ? tilde(this.folder, this.userHome) : "This folder"} is not in a git repository.`
+          ? this.error && remove ? "Removal is unavailable." : `${this.folder ? tilde(this.folder, this.userHome) : "This folder"} is not in a git repository.`
           : remove
             ? !r.linked
               ? "This is the repository's main checkout, not a worktree."
-              : this.removed ? "Worktree removed. You can retry any remaining branch cleanup." : `Deletes the entire checkout at ${tilde(r.top, this.userHome)}, including ignored files such as .idea. Branches stay unless selected below.`
+              : this.removed ? `Worktree removed. Branch cleanup target: ${removeBranch ?? "none"}.` : `Deletes the entire checkout at ${tilde(r.top, this.userHome)}, including ignored files such as .idea. Branches stay unless selected below.`
             : this.sourceLabel ? `Start from ${this.sourceLabel}. Uncommitted edits stay in the original checkout.` : "Creates the checkout under the configured machine worktree root.";
     const affectedAgentRows = (this.affectedAgents ?? []).map((agent, index) => {
       const detail = this.closePlan?.agentStatuses?.find((item) => item.address === agent.address);
@@ -605,7 +648,7 @@ export default class Worktree extends View {
       return div().id(`affected-agent-${index}`).flex_none().text_size(11).text_color(t.muted)
         .child(`${agent.title || agent.address}${owner ? ` · ${owner}` : ""}${detail?.status ? ` · ${detail.status}` : ""}`);
     });
-    const blocked = !r || (remove && !r.linked);
+    const blocked = !r || (remove && !this.removalCheckout);
     let destination = "";
     if (!remove && r && this.worktreeRoot && this.text.trim()) {
       try { destination = flatDestination(this.worktreeRoot, r.name, this.text.trim()); } catch {}
@@ -632,10 +675,10 @@ export default class Worktree extends View {
       ))
       .when(remove && this.dirty, (el) => el.child(div().text_color(t.blocked).child("It has uncommitted changes: they will be lost.")))
       .when(remove && this.unpushed.length > 0, (el) => el.child(div().text_color(t.blocked).child(`Submodule ${this.unpushed.join(", ")} has commits that aren't pushed anywhere: they will be lost.`)))
-      .when(remove && !blocked && Boolean(this.removeBranch) && !this.removed && !this.busy, el => el.child(h_flex().gap(8)
+      .when(remove && !blocked && Boolean(removeBranch) && !this.removed && !this.busy, el => el.child(h_flex().gap(8)
         .child(button("worktree-delete-local", `${this.deleteLocal ? "☑" : "☐"} Delete local branch`, cx => { this.deleteLocal = !this.deleteLocal; cx.notify(); }))
         .when(Boolean(this.removeOrigin), row => row.child(button("worktree-delete-origin", `${this.deleteOrigin ? "☑" : "☐"} Delete from origin`, cx => { this.deleteOrigin = !this.deleteOrigin; cx.notify(); })))
-        .child(div().text_color(t.muted).child(`Branch: ${this.removeBranch}`))))
+        .child(div().text_color(t.muted).child(`Branch: ${removeBranch}`))))
       .when(!remove && !blocked && !this.pendingLaunch, (el) =>
         el.child(
           Input.new(this.input)

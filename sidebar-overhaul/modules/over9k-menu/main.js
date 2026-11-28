@@ -359,7 +359,7 @@ export default class Menu extends View {
       try { cx.spawn((cx) => this.loadWorktrees(cx)); } catch {}
     }
     const space = p?.tab === "space" && spaces().find((s) => s.id === p.target?.id);
-    const folder = space && place(space);
+    const folder = space && space.folder;
     if (folder)
       cx.spawn(async (cx) => {
         this.git = await checkout(folder, space.machine).catch(() => null);

@@ -4,7 +4,7 @@ import { mock } from "bun:test";
 import { mkdtemp, mkdir, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { createNativeTestHost } from "../over9k/native-test-host.js";
+import { createNativeTestHost, textOf, trigger } from "../over9k/native-test-host.js";
 import { buildClosePlan } from "./close-plan.js";
 
 const host = createNativeTestHost();
@@ -30,7 +30,7 @@ const sidebarConfig = JSON.stringify({
   options: {},
 });
 mock.module("gpui-kit", () => host.gpuiKit);
-mock.module("gpui-base", () => ({ ...host.gpuiBase, InputState: {}, Input: {}, Scrollbar: {} }));
+mock.module("gpui-base", () => ({ ...host.gpuiBase, InputState: { new: () => ({ on() {}, focus() {} }) }, Input: {}, Scrollbar: {} }));
 mock.module("herdr", () => ({
   ...host.herdr,
   props: () => viewProps,
@@ -210,21 +210,37 @@ test("existing checkout setup refuses a missing script and opens only a setup ta
   } finally { execOverride = undefined; }
 });
 
+const removalHead = "a".repeat(40);
+const registration = (main, folder, branch = "feature", head = removalHead, flags = []) =>
+  [`worktree ${main}\0bare`, [`worktree ${folder}`, `HEAD ${head}`, branch ? `branch refs/heads/${branch}` : "detached", ...flags].join("\0"), ""].join("\0\0");
+
+function removalGit(args, { main, top }, branch = "feature", head = removalHead) {
+  if (args.includes("--show-toplevel")) return { code: 0, stdout: top };
+  if (args.includes("--git-common-dir")) return { code: 0, stdout: `${main}/.git` };
+  if (args[0] === "worktree" && args[1] === "list") return { code: 0, stdout: registration(main, top, branch, head) };
+  if (args[0] === "rev-parse" && args[1] === "--verify") return { code: 0, stdout: head };
+}
+
+function reviewedRemoval(view) {
+  view.removalCheckout = { id: "feature", path: view.repo.top, main: view.repo.main, branch: "feature", head: removalHead };
+}
+
 test("branch cleanup requires opt-in and leases the exact origin tip", async () => {
   const folder = "/projects/repo-feature";
   const spaces = [{ id: "feature", name: "feature", folder, tabs: [] }];
   const origin = "/projects/origin.git";
   const sha = "a".repeat(40);
-  for (const cleanup of [false, true]) {
+  for (const [local, remote] of [[false, false], [true, false], [false, true], [true, true]]) {
     host.reset({ spaces });
     viewProps = { action: "remove", space: "feature" };
     const view = new Worktree();
     view.repo = { main: "/projects/repo", top: folder, linked: true };
     view.closePlan = buildClosePlan({ spaces: ["feature"] }, { spaces });
+    reviewedRemoval(view);
     view.unpushed = [];
-    view.removeBranch = "feature";
     view.removeOrigin = origin;
-    view.deleteLocal = view.deleteOrigin = cleanup;
+    view.deleteLocal = local;
+    view.deleteOrigin = remote;
     const mutations = [];
     let closeCalls = 0;
     let removeCalls = 0;
@@ -235,26 +251,28 @@ test("branch cleanup requires opt-in and leases the exact origin tip", async () 
         host.state.spaces = [];
         return { code: 0, stdout: "{}" };
       }
-      if (args.includes("--show-toplevel")) return { code: 0, stdout: folder };
-      if (args.includes("--git-common-dir")) return { code: 0, stdout: "/projects/repo/.git" };
-      if (args[0] === "worktree" && cleanup && ++removeCalls === 1) return { code: 1, stderr: "Checkout busy" };
+      const read = removalGit(args, view.repo);
+      if (read) return read;
+      if (args[0] === "worktree" && local && remote && ++removeCalls === 1) return { code: 1, stderr: "Checkout busy" };
       if (["worktree", "branch", "push"].includes(args[0])) mutations.push(args);
-      if (args[0] === "symbolic-ref") return { code: 0, stdout: "feature" };
-      if (args[0] === "remote") return { code: 0, stdout: origin };
-      if (args[0] === "ls-remote") return { code: 0, stdout: `${sha}\trefs/heads/feature` };
+      assert.notEqual(args[0], "symbolic-ref", "cleanup must use the registered branch");
+      if (args[0] === "remote") {
+        assert.equal(remote, true, "local-only cleanup must not query origin");
+        return { code: 0, stdout: origin };
+      }
+      if (args[0] === "ls-remote") return { code: 0, stdout: `ref: refs/heads/dev\tHEAD\n${sha}\trefs/heads/feature` };
       return { code: 0, stdout: "" };
     };
     try {
-      if (cleanup) {
+      if (local && remote) {
         assert.equal(await view.remove(), "Checkout busy");
         assert.deepEqual(mutations, []);
       }
       assert.equal(await view.remove(), "");
       assert.equal(closeCalls, 1);
-      assert.deepEqual(mutations, [["worktree", "remove", folder], ...(cleanup ? [
-        ["push", `--force-with-lease=refs/heads/feature:${sha}`, "--", origin, ":refs/heads/feature"],
-        ["branch", "-d", "--", "feature"],
-      ] : [])]);
+      assert.deepEqual(mutations, [["worktree", "remove", folder],
+        ...(remote ? [["push", `--force-with-lease=refs/heads/feature:${sha}`, "--", origin, ":refs/heads/feature"]] : []),
+        ...(local ? [["branch", "-d", "--", "feature"]] : [])]);
     } finally { execOverride = undefined; viewProps = { overlay: "worktree-dialog" }; }
   }
 });
@@ -266,6 +284,7 @@ test("worktree removal waits for close acknowledgement and retries only the revi
   const view = new Worktree();
   view.repo = { main: "/projects/repo", top: folder, linked: true };
   view.closePlan = buildClosePlan({ spaces: ["feature"] }, { spaces: host.state.spaces });
+  reviewedRemoval(view);
   view.unpushed = [];
   view.removeBranch = "feature";
   let acknowledgeClose;
@@ -277,7 +296,8 @@ test("worktree removal waits for close acknowledgement and retries only the revi
       assert.equal(args[1], "space.close");
       return new Promise(resolve => { acknowledgeClose = resolve; reachedClose(); });
     }
-    if (args[0] === "symbolic-ref") return { code: 0, stdout: "feature" };
+    const read = removalGit(args, view.repo);
+    if (read) return read;
     if (args[0] === "worktree" && args[1] === "remove") removals.push(args);
     return { code: 0, stdout: "", stderr: "" };
   };
@@ -301,6 +321,7 @@ test("removal cleans residual IDE files without deleting a replacement checkout"
   const view = new Worktree();
   view.repo = { main: join(root, "repo"), top: folder, linked: true };
   view.closePlan = buildClosePlan({ spaces: ["feature"] }, { spaces });
+  reviewedRemoval(view);
   view.unpushed = [];
   view.removeBranch = "feature";
   let gitRemovals = 0;
@@ -313,7 +334,8 @@ test("removal cleans residual IDE files without deleting a replacement checkout"
       const result = Bun.spawnSync([command, ...args]);
       return { code: result.exitCode, stderr: result.stderr.toString() };
     }
-    if (args[0] === "symbolic-ref") return { code: 0, stdout: "feature" };
+    const read = removalGit(args, view.repo);
+    if (read) return read;
     if (args[0] === "worktree" && args[1] === "remove") gitRemovals++;
     return { code: 0, stdout: "" };
   };
@@ -327,6 +349,192 @@ test("removal cleans residual IDE files without deleting a replacement checkout"
     assert.equal(await view.remove(), "");
     await assert.rejects(stat(folder), { code: "ENOENT" });
     assert.equal(gitRemovals, 1);
+  } finally {
+    execOverride = undefined;
+    viewProps = { overlay: "worktree-dialog" };
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+// Exercise the dialog initialization and confirmation together. The earlier
+// command-only tests supplied a branch by hand and missed the wrong-source bug.
+const removalScenarios = {
+  "wrong pane directory": "", detached: "",
+  "duplicate registration": /exact registered linked worktree/, "space changed machine": /selected space changed/,
+  "main checkout": /root of a linked worktree/, "missing registration": /exact registered linked worktree/,
+  "registration unreadable": /unreadable registrations/, locked: /not usable/, prunable: /not usable/,
+  "invalid HEAD": /exact branch and commit/, "missing branch": /exact branch and commit/,
+  "space moved": /selected space changed/, "checkout replaced": /checkout changed/,
+  "space moved during origin lookup": /selected space changed/,
+  "branch changed": /branch or commit changed/, "commit changed": /branch or commit changed/,
+  "branch changed during close": /branch or commit changed/, "close rejected": /could not confirm/i,
+  "space still open": /still open/, "origin changed": /push destination changed/, "default branch": /default branch \(corrections\)/,
+  "space reopened during removal": /still open/,
+  "origin unavailable": /origin offline/, "default unknown": /Could not verify the default branch/,
+  "origin tip invalid": /Could not verify the origin branch tip/, "origin tip moved": /Origin branch kept: its tip changed/,
+  "local tip moved": /Local branch kept: its tip/, "origin push rejected": /Origin branch kept: rejected/,
+  "local delete rejected": /Local branch kept: not merged/, "absent origin branch": "",
+  "status failed": /status unavailable/, "new dirty files": /Review the warnings/,
+};
+for (const [scenario, expected] of Object.entries(removalScenarios)) {
+  test(`worktree removal: ${scenario}`, async () => {
+    const folder = "/workspaces/Reaparr.git-corrections", dev = "/workspaces/Reaparr-dev", main = "/workspaces/store.git";
+    const id = "unraid-dev/corrections", machine = "unraid-dev", origin = "/fixture/origin.git";
+    const branch = scenario === "detached" ? null : "corrections";
+    const mutations = [];
+    let confirmed = false, closed = false;
+    let retry = false;
+    host.reset({ spaces: [{ id, machine, folder, name: "corrections", tabs: [{ id: "tab" }] }], panes: [{ tab: "tab", cwd: dev }] });
+    viewProps = { action: "remove", space: id };
+    execOverride = async (command, args, { cwd, on } = {}) => {
+      if (command === "herdr-app") {
+        assert.equal(args[1], "space.close");
+        assert.deepEqual(JSON.parse(args[2]), { id, confirmed: true });
+        mutations.push("close");
+        if (scenario === "close rejected") return { code: 1, stderr: "refused" };
+        if (scenario !== "space still open") host.state.spaces = [];
+        closed = true;
+        return { code: 0, stdout: "{}" };
+      }
+      assert.equal(on, machine);
+      if (command === "sh") return { code: 0, stdout: "/home/dev" };
+      assert.notEqual(cwd, dev, "never inspect the pane’s dev checkout");
+      if (args.includes("--show-toplevel")) return { code: 0, stdout: scenario === "main checkout" ? main : folder };
+      if (args.includes("--git-common-dir")) return { code: 0, stdout: confirmed && scenario === "checkout replaced" ? "/workspaces/replacement.git" : main };
+      if (args[0] === "worktree" && args[1] === "list") {
+        if (scenario === "registration unreadable") return { code: 1, stderr: "unreadable registrations" };
+        const ref = (confirmed && scenario === "branch changed") || (closed && scenario === "branch changed during close") ? "dev" : branch;
+        const head = scenario === "invalid HEAD" ? "invalid" : confirmed && scenario === "commit changed" ? "b".repeat(40) : removalHead;
+        const flags = ["locked", "prunable"].includes(scenario) ? [scenario] : [];
+        if (closed && scenario === "space reopened during removal") host.state.spaces = [{ id: "replacement", machine, folder }];
+        const output = registration(main, scenario === "missing registration" ? dev : folder, ref, head, flags);
+        if (scenario === "duplicate registration") return { code: 0, stdout: output + output };
+        return { code: 0, stdout: scenario === "missing branch" ? output.replace("branch refs/heads/corrections\0", "\0") : output };
+      }
+      if (confirmed && args.includes("status")) {
+        if (scenario === "status failed") return { code: 1, stderr: "status unavailable" };
+        if (scenario === "new dirty files") return { code: 0, stdout: "?? untracked" };
+      }
+      if (args[0] === "remote") return { code: 0, stdout: confirmed && scenario === "origin changed" ? "/other/origin.git" : origin };
+      if (args[0] === "ls-remote") {
+        if (scenario === "space moved during origin lookup") host.state.spaces[0].folder = dev;
+        if (scenario === "origin unavailable") return { code: 1, stderr: "origin offline" };
+        const defaultRef = scenario === "default branch" || (retry && scenario === "origin push rejected") ? "corrections" : "dev";
+        const tip = scenario === "origin tip invalid" ? "broken" : closed && scenario === "origin tip moved" ? "b".repeat(40) : removalHead;
+        const refLine = scenario === "absent origin branch" ? "" : `${tip}\trefs/heads/corrections`;
+        return { code: 0, stdout: `${scenario === "default unknown" ? "" : `ref: refs/heads/${defaultRef}\tHEAD\n`}${refLine}` };
+      }
+      if (args[0] === "rev-parse" && args[1] === "--verify") {
+        assert.equal(args[2], "refs/heads/corrections");
+        return { code: 0, stdout: scenario === "local tip moved" ? "b".repeat(40) : removalHead };
+      }
+      if (args[0] === "worktree" && args[1] === "remove") {
+        assert.equal(args.at(-1), folder);
+        mutations.push("remove");
+      } else if (args[0] === "push") {
+        assert.equal(args.at(-1), ":refs/heads/corrections");
+        mutations.push("push corrections");
+        if (scenario === "origin push rejected") return { code: 1, stderr: "rejected" };
+      } else if (args[0] === "branch") {
+        assert.equal(args.at(-1), "corrections");
+        mutations.push("delete corrections");
+        if (scenario === "local delete rejected") return { code: 1, stderr: "not merged" };
+      }
+      return { code: 0, stdout: "" };
+    };
+    const pending = [];
+    const context = { ...host.context(), focus_handle: () => ({ focus() {} }), spawn: fn => pending.push(fn(context)) };
+    try {
+      const view = new Worktree();
+      view.init(viewProps, context);
+      await Promise.all(pending);
+      confirmed = true;
+      if (scenario === "space moved") host.state.spaces[0].folder = dev;
+      if (scenario === "space changed machine") host.state.spaces[0].machine = "other-machine";
+      if (scenario === "wrong pane directory") {
+        const dialog = view.render(context);
+        assert.match(textOf(dialog), /Branch: corrections/);
+        assert.doesNotMatch(textOf(dialog), /Branch: dev/);
+        trigger(dialog, "worktree-delete-local", "click", {}, context);
+        trigger(view.render(context), "worktree-delete-origin", "click", {}, context);
+        trigger(view.render(context), "worktree-remove-yes", "click", {}, context);
+        await pending.at(-1);
+      } else {
+        view.deleteLocal = view.deleteOrigin = Boolean(branch);
+        await view.work(context);
+      }
+      if (expected) assert.match(view.error, expected);
+      else assert.equal(view.error, "");
+      if (!expected || ["origin tip moved", "local tip moved", "origin push rejected", "local delete rejected"].includes(scenario)) {
+        assert.deepEqual(mutations, ["close", "remove",
+          ...(!["detached", "origin tip moved", "absent origin branch"].includes(scenario) ? ["push corrections"] : []),
+          ...(!["detached", "local tip moved"].includes(scenario) ? ["delete corrections"] : [])]);
+      } else assert.deepEqual(mutations, ["space reopened during removal"].includes(scenario) ? ["close", "remove"]
+        : ["branch changed during close", "close rejected", "space still open"].includes(scenario) ? ["close"] : []);
+      if (scenario === "origin push rejected") {
+        retry = true;
+        const before = [...mutations];
+        await view.work(context);
+        assert.match(view.error, /Refusing to delete origin’s default branch \(corrections\)/);
+        assert.deepEqual(mutations, before, "retry must not push or repeat successful local cleanup");
+      }
+    } finally { execOverride = undefined; viewProps = { overlay: "worktree-dialog" }; }
+  });
+}
+
+test("real Git removes corrections and preserves dev when the corrections pane is in dev", async () => {
+  const root = await mkdtemp(join(tmpdir(), "herdr-delete-"));
+  const origin = join(root, "origin.git"), store = join(root, "store.git");
+  const dev = join(root, "dev"), corrections = join(root, "corrections");
+  const id = "corrections";
+  const git = (args, cwd = root) => {
+    const result = Bun.spawnSync(["git", "-c", "core.hooksPath=/dev/null", "-c", "user.name=Test", "-c", "user.email=test@example.invalid", ...args], { cwd });
+    return { code: result.exitCode, stdout: result.stdout.toString(), stderr: result.stderr.toString() };
+  };
+  const checked = (args, cwd) => {
+    const result = git(args, cwd);
+    assert.equal(result.code, 0, result.stderr);
+    return result.stdout.trim();
+  };
+  try {
+    checked(["init", "--bare", "-b", "dev", origin]);
+    checked(["init", "--bare", "-b", "dev", store]);
+    const tree = checked(["mktree"], store);
+    const tip = checked(["commit-tree", tree, "-m", "base"], store);
+    checked(["update-ref", "refs/heads/dev", tip], store);
+    checked(["branch", "corrections", "dev"], store);
+    checked(["remote", "add", "origin", origin], store);
+    checked(["push", "origin", "dev", "corrections"], store);
+    checked(["worktree", "add", dev, "dev"], store);
+    checked(["worktree", "add", corrections, "corrections"], store);
+    host.reset({ spaces: [{ id, folder: corrections, tabs: [{ id: "tab" }] }], panes: [{ tab: "tab", cwd: dev }] });
+    viewProps = { action: "remove", space: id };
+    execOverride = async (command, args, { cwd } = {}) => {
+      if (command === "git") return git(args, cwd);
+      if (command === "herdr-app") {
+        assert.deepEqual(JSON.parse(args[2]), { id, confirmed: true });
+        host.state.spaces = [];
+        return { code: 0, stdout: "{}" };
+      }
+      assert.equal(command, "sh");
+      assert.equal(args.at(-1), corrections);
+      return { code: 0 };
+    };
+    const pending = [];
+    const cx = { ...host.context(), focus_handle: () => ({ focus() {} }), spawn: fn => pending.push(fn(cx)) };
+    const view = new Worktree();
+    view.init(viewProps, cx);
+    await Promise.all(pending);
+    assert.equal(view.error, "");
+    view.deleteLocal = view.deleteOrigin = true;
+    await view.work(cx);
+    assert.equal(view.error, "");
+    for (const repo of [store, origin]) {
+      assert.equal(checked(["rev-parse", "--verify", "refs/heads/dev"], repo), tip);
+      assert.notEqual(git(["show-ref", "--verify", "--quiet", "refs/heads/corrections"], repo).code, 0);
+    }
+    assert.equal(checked(["symbolic-ref", "HEAD"], dev), "refs/heads/dev");
+    await assert.rejects(stat(corrections), { code: "ENOENT" });
   } finally {
     execOverride = undefined;
     viewProps = { overlay: "worktree-dialog" };

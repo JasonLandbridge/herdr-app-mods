@@ -261,7 +261,7 @@ Left to right. All colours are theme names (`canvas`, `chrome`, `background`,
 - Branch filtering never creates a branch. Use **New branch from this…** or choose the explicit create action after an unmatched search. Review checks executables and explicit script files on the target machine without running hooks.
 - Existing checkouts offer **Open in OMP**, **Open shell**, **Copy path**, and **Run setup…**. Setup opens a separate terminal only after you review and confirm; it never recreates the checkout. Retrying a failed setup returns to its original checkout before running commands.
 - If Git creates the checkout but Herdr cannot open it, use **Open worktree** to retry opening it without creating it again. If a setup hook fails, click **Setup failed** in the sidebar to inspect the setup terminal.
-- **Remove worktree** requires **Yes**. Local and origin branch cleanup are separate opt-ins. Local cleanup respects Git's merged-branch check; origin cleanup refuses to delete a branch that moved after its tip was checked.
+- **Remove worktree** requires **Yes** and uses the selected space’s exact Git worktree registration, never a terminal’s working directory. Local and origin branch cleanup are separate opt-ins. Cleanup refuses a changed local tip and will not delete the default branch on origin.
 - Removal deletes the entire checkout directory, including ignored files. If Git or directory cleanup fails after the space closes, use **Retry removal** in the same dialog. Branch cleanup starts only after the checkout directory is gone.
 
 ## Done when
